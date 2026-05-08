@@ -1,0 +1,1865 @@
+"use client";
+
+/* eslint-disable @next/next/no-img-element */
+import { useRouter } from "next/navigation";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
+} from "react";
+import { softDeletePhotos } from "@/app/actions";
+import { DeleteConfirmDialog } from "@/app/delete-confirm-dialog";
+import { formatFileSize, koDate } from "@/lib/format";
+import { photoAssetUrl, type PhotoAssetVariant } from "@/lib/photo-assets";
+import type { Photo } from "@/lib/types";
+
+type PhotoWithUrl = Photo & {
+  url?: string;
+};
+
+type EditedPhotoResponse = {
+  saved?: boolean;
+  photo?: Photo;
+  error?: string;
+};
+
+type DeletePhotoResponse = {
+  deleted?: boolean;
+  error?: string;
+};
+
+type ViewerTransform = {
+  scale: number;
+  x: number;
+  y: number;
+};
+
+type PointerPoint = {
+  x: number;
+  y: number;
+};
+
+type MobileArrowSide = "left" | "right" | null;
+
+type CropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type CropHandle = "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se";
+
+type Size = {
+  width: number;
+  height: number;
+};
+
+type ImageBounds = Size & {
+  x: number;
+  y: number;
+  renderedRatio: number;
+};
+
+const MIN_SCALE = 1;
+const MAX_SCALE = 5;
+const MIN_CROP_SIZE = 56;
+const MOBILE_ARROW_HIDE_DELAY = 2000;
+const PHOTOS_PER_PAGE = 20;
+const viewerPrefetchCache = new Map<string, Promise<void>>();
+
+type NetworkInfo = {
+  connection?: {
+    effectiveType?: string;
+    saveData?: boolean;
+  };
+};
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function blobType(mimeType: string | null) {
+  if (mimeType === "image/png" || mimeType === "image/webp") {
+    return mimeType;
+  }
+
+  return "image/jpeg";
+}
+
+async function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string | null) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) {
+          resolve(blob);
+        } else {
+          reject(new Error("이미지를 저장할 수 없습니다."));
+        }
+      },
+      blobType(mimeType),
+      0.92,
+    );
+  });
+}
+
+function drawCoverImage(
+  context: CanvasRenderingContext2D,
+  image: CanvasImageSource,
+  source: { x: number; y: number; width: number; height: number },
+  outputWidth: number,
+  outputHeight: number,
+) {
+  context.drawImage(
+    image,
+    source.x,
+    source.y,
+    source.width,
+    source.height,
+    0,
+    0,
+    outputWidth,
+    outputHeight,
+  );
+}
+
+function sortPhotosLatestFirst<T extends Photo>(photos: T[]) {
+  return [...photos].sort(
+    (first, second) =>
+      new Date(second.created_at).getTime() - new Date(first.created_at).getTime(),
+  );
+}
+
+function RotateIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.05"
+    >
+      <path d="M8.9 5.1H5.1v3.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M5.3 8.9A7.5 7.5 0 1 1 7.3 17" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function CropIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.1">
+      <path d="M6 3v13.2a1.8 1.8 0 0 0 1.8 1.8H21" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M18 21V7.8A1.8 1.8 0 0 0 16.2 6H3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function SaveIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+    >
+      <path d="M5.2 4.8h11l2.8 2.8v11.2a1.4 1.4 0 0 1-1.4 1.4H6.6a1.4 1.4 0 0 1-1.4-1.4V6.2a1.4 1.4 0 0 1 1.4-1.4Z" strokeLinejoin="round" />
+      <path d="M8.2 4.8v5.1h7.1V4.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M8.8 20.2v-5.4h6.4v5.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.1">
+      <path d="M18 6 6 18" strokeLinecap="round" />
+      <path d="m6 6 12 12" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.05"
+    >
+      <path d="M4.9 6.9h14.2" strokeLinecap="round" />
+      <path d="m8.4 6.9.4-1.6a1 1 0 0 1 1-.8h4.4a1 1 0 0 1 1 .8l.4 1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="m7.5 6.9.7 10.7a1.5 1.5 0 0 0 1.5 1.4h4.6a1.5 1.5 0 0 0 1.5-1.4l.7-10.7" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M10 10.2v5.1" strokeLinecap="round" />
+      <path d="M14 10.2v5.1" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function ViewerPrevIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2.25">
+      <path d="m14.8 5.8-6.2 6.2 6.2 6.2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function ViewerNextIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2.25">
+      <path d="m9.2 5.8 6.2 6.2-6.2 6.2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function SelectionCheckIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 16 16" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2.6">
+      <path d="m3.2 8.2 2.6 2.6 7-7" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function imageRouteForPhoto(
+  classNo: number,
+  groupId: string,
+  photoId: string,
+  access: string,
+  variant: PhotoAssetVariant,
+) {
+  return photoAssetUrl({
+    classNo,
+    groupId,
+    photoId,
+    access,
+    variant,
+  });
+}
+
+function prefetchViewerImage(url: string) {
+  if (!url) {
+    return Promise.resolve();
+  }
+  const pending = viewerPrefetchCache.get(url);
+  if (pending) {
+    return pending;
+  }
+
+  const promise = loadImageElement(url)
+    .then(() => undefined)
+    .finally(() => {
+      viewerPrefetchCache.delete(url);
+    });
+
+  viewerPrefetchCache.set(url, promise);
+  return promise;
+}
+
+function loadImageElement(
+  url: string,
+  signal?: AbortSignal,
+) {
+  if (!url) {
+    return Promise.reject(new Error("이미지 주소가 없습니다."));
+  }
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    let settled = false;
+
+    function cleanup() {
+      image.onload = null;
+      image.onerror = null;
+      if (signal) {
+        signal.removeEventListener("abort", handleAbort);
+      }
+    }
+
+    function succeed() {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      resolve(image);
+    }
+
+    function fail(error: Error) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      reject(error);
+    }
+
+    function handleAbort() {
+      fail(new DOMException("이미지 요청이 취소되었습니다.", "AbortError"));
+    }
+
+    image.onload = () => succeed();
+    image.onerror = () => fail(new Error("이미지를 표시할 수 없습니다."));
+
+    if (signal) {
+      if (signal.aborted) {
+        handleAbort();
+        return;
+      }
+
+      signal.addEventListener("abort", handleAbort, { once: true });
+    }
+
+    image.decoding = "async";
+    image.src = url;
+
+    if (image.complete && image.naturalWidth && image.naturalHeight) {
+      succeed();
+      return;
+    }
+
+    if (typeof image.decode === "function") {
+      void image.decode().then(() => {
+        if (image.naturalWidth && image.naturalHeight) {
+          succeed();
+        }
+      }).catch(() => undefined);
+    }
+  });
+}
+
+function layerStylesFor(
+  imageSize: Size | null,
+  stageSize: Size | null,
+  rotation: number,
+  transform: ViewerTransform,
+) {
+  if (!imageSize || !stageSize?.width || !stageSize.height) {
+    return null;
+  }
+
+  const normalizedRotation = ((rotation % 360) + 360) % 360;
+  const rotatedImageSize =
+    normalizedRotation === 90 || normalizedRotation === 270
+      ? { width: imageSize.height, height: imageSize.width }
+      : imageSize;
+
+  const ratio = Math.min(stageSize.width / rotatedImageSize.width, stageSize.height / rotatedImageSize.height);
+  const width = rotatedImageSize.width * ratio;
+  const height = rotatedImageSize.height * ratio;
+
+  return {
+    containerStyle: {
+      width,
+      height,
+      transform: `translate(-50%, -50%) translate3d(${transform.x}px, ${transform.y}px, 0) scale(${transform.scale})`,
+    },
+    imageStyle: {
+      width: normalizedRotation === 90 || normalizedRotation === 270 ? height : width,
+      height: normalizedRotation === 90 || normalizedRotation === 270 ? width : height,
+      transform: `translate(-50%, -50%) rotate(${rotation}deg)`,
+    },
+  };
+}
+
+function shouldPrefetchViewerImages() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const connection = (navigator as Navigator & NetworkInfo).connection;
+  if (!connection) {
+    return true;
+  }
+
+  return !connection.saveData && !String(connection.effectiveType ?? "").includes("2g");
+}
+
+function isMobileViewerArrowMode() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  return window.matchMedia("(max-width: 639px)").matches;
+}
+
+export function PhotoGallery({
+  classNo,
+  groupId,
+  access,
+  photos,
+}: {
+  classNo: number;
+  groupId: string;
+  access: string;
+  photos: Photo[];
+}) {
+  const router = useRouter();
+  const localPreviewUrls = useRef<Map<string, string>>(new Map());
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedPhotoIds, setSelectedPhotoIds] = useState<Set<string>>(() => new Set());
+  const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+  const [displayPhotos, setDisplayPhotos] = useState<PhotoWithUrl[]>(() => sortPhotosLatestFirst(photos));
+  const [pageIndex, setPageIndex] = useState(0);
+  const [batchDeleteDialogOpen, setBatchDeleteDialogOpen] = useState(false);
+  const selectedCount = selectedPhotoIds.size;
+  const batchFormId = `photo-delete-${groupId}`;
+  const totalSize = displayPhotos.reduce((sum, photo) => sum + (photo.size ?? 0), 0);
+  const pageCount = Math.max(1, Math.ceil(displayPhotos.length / PHOTOS_PER_PAGE));
+  const currentPageIndex = Math.min(pageIndex, pageCount - 1);
+  const pageStart = currentPageIndex * PHOTOS_PER_PAGE;
+  const visiblePhotos = displayPhotos.slice(pageStart, pageStart + PHOTOS_PER_PAGE);
+
+  useEffect(() => {
+    setDisplayPhotos((current) => {
+      const currentById = new Map(current.map((photo) => [photo.id, photo]));
+      const photoIds = new Set(photos.map((photo) => photo.id));
+
+      for (const [photoId, previewUrl] of localPreviewUrls.current) {
+        if (!photoIds.has(photoId)) {
+          URL.revokeObjectURL(previewUrl);
+          localPreviewUrls.current.delete(photoId);
+        }
+      }
+
+      return sortPhotosLatestFirst(photos.map((photo) => {
+        const previewUrl = localPreviewUrls.current.get(photo.id);
+        const currentPhoto = currentById.get(photo.id);
+
+        return previewUrl
+          ? {
+              ...photo,
+              mime_type: currentPhoto?.mime_type ?? photo.mime_type,
+              size: currentPhoto?.size ?? photo.size,
+              url: previewUrl,
+            }
+          : { ...photo };
+      }));
+    });
+  }, [photos]);
+
+  useEffect(() => {
+    const previewUrls = localPreviewUrls.current;
+
+    return () => {
+      for (const previewUrl of previewUrls.values()) {
+        URL.revokeObjectURL(previewUrl);
+      }
+      previewUrls.clear();
+    };
+  }, []);
+
+  function handlePhotoEdited(previousPhotoId: string, editedPhoto: Photo, blob: Blob) {
+    const previousUrl = localPreviewUrls.current.get(previousPhotoId);
+    if (previousUrl) {
+      URL.revokeObjectURL(previousUrl);
+      localPreviewUrls.current.delete(previousPhotoId);
+    }
+
+    const previewUrl = URL.createObjectURL(blob);
+    localPreviewUrls.current.set(editedPhoto.id, previewUrl);
+    setDisplayPhotos((current) =>
+      sortPhotosLatestFirst(current.map((photo) =>
+        photo.id === previousPhotoId
+          ? {
+              ...editedPhoto,
+              url: previewUrl,
+            }
+          : photo,
+      )),
+    );
+    router.refresh();
+  }
+
+  function handlePhotoDeleted(photoId: string) {
+    const previewUrl = localPreviewUrls.current.get(photoId);
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+      localPreviewUrls.current.delete(photoId);
+    }
+
+    const deletedIndex = displayPhotos.findIndex((candidate) => candidate.id === photoId);
+    if (deletedIndex === -1) {
+      return;
+    }
+
+    const nextPhotos = displayPhotos.filter((candidate) => candidate.id !== photoId);
+    setDisplayPhotos(nextPhotos);
+    setSelectedPhotoIds((current) => {
+      const next = new Set(current);
+      next.delete(photoId);
+      return next;
+    });
+
+    if (viewerIndex !== null) {
+      if (!nextPhotos.length) {
+        setViewerIndex(null);
+      } else if (viewerIndex > deletedIndex) {
+        setViewerIndex(viewerIndex - 1);
+      } else if (viewerIndex === deletedIndex) {
+        setViewerIndex(Math.min(deletedIndex, nextPhotos.length - 1));
+      }
+    }
+
+    router.refresh();
+  }
+
+  function toggleSelectionMode() {
+    setSelectionMode((current) => {
+      if (current) {
+        setSelectedPhotoIds(new Set());
+      }
+      return !current;
+    });
+  }
+
+  function togglePhoto(photoId: string) {
+    setSelectedPhotoIds((current) => {
+      const next = new Set(current);
+      if (next.has(photoId)) {
+        next.delete(photoId);
+      } else {
+        next.add(photoId);
+      }
+      return next;
+    });
+  }
+
+  function openPhoto(index: number) {
+    if (selectionMode) {
+      togglePhoto(displayPhotos[index].id);
+      return;
+    }
+
+    const preloadIndexes = new Set<number>([
+      index,
+      (index + 1) % displayPhotos.length,
+      (index + 2) % displayPhotos.length,
+      (index - 1 + displayPhotos.length) % displayPhotos.length,
+    ]);
+
+    for (const preloadIndex of preloadIndexes) {
+      const targetPhoto = displayPhotos[preloadIndex];
+      if (!targetPhoto?.id || targetPhoto.url) {
+        continue;
+      }
+
+      void prefetchViewerImage(
+        imageRouteForPhoto(classNo, groupId, targetPhoto.id, access, "viewer"),
+      ).catch(() => null);
+    }
+
+    setViewerIndex(index);
+  }
+
+  return (
+    <div className="grid w-full min-w-0 max-w-full gap-3 overflow-hidden">
+      <form
+        id={batchFormId}
+        action={softDeletePhotos}
+        onSubmit={(event) => {
+          if (!selectedCount) {
+            event.preventDefault();
+          }
+        }}
+        className="flex w-full min-w-0 max-w-full flex-wrap items-center justify-between gap-3"
+        suppressHydrationWarning
+      >
+        <input type="hidden" name="classNo" value={classNo} />
+        <input type="hidden" name="groupId" value={groupId} />
+        <input type="hidden" name="access" value={access} />
+        {[...selectedPhotoIds].map((photoId) => (
+          <input key={photoId} type="hidden" name="photoId" value={photoId} />
+        ))}
+
+        <p className="min-w-0 truncate text-sm font-medium text-zinc-600">
+          {selectionMode ? `${selectedCount}장 선택됨` : `사진 ${displayPhotos.length}장 · ${formatFileSize(totalSize)}`}
+        </p>
+        <div className="flex shrink-0 gap-2">
+          <button
+            type="button"
+            onClick={toggleSelectionMode}
+            className={`rounded-md border border-gray-300 px-3 py-2 text-sm font-semibold ${
+              selectionMode
+                ? "bg-teal-50 text-teal-800 ring-teal-200"
+                : "bg-white text-zinc-800 ring-zinc-300"
+            }`}
+          >
+            선택
+          </button>
+          <button
+            type="button"
+            disabled={!selectedCount}
+            onClick={() => setBatchDeleteDialogOpen(true)}
+            className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-zinc-100 disabled:text-zinc-400"
+          >
+            삭제
+          </button>
+        </div>
+      </form>
+
+      <section className="grid w-full min-w-0 max-w-full grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+        {visiblePhotos.map((photo, index) => {
+          const selected = selectedPhotoIds.has(photo.id);
+
+          return (
+            <article
+              key={photo.id}
+              className={`min-w-0 overflow-hidden rounded-lg border bg-white shadow-sm ${
+                selected ? "border-teal-500 ring-2 ring-teal-200" : "border-zinc-200"
+              }`}
+            >
+              <button
+                type="button"
+                onClick={() => openPhoto(pageStart + index)}
+                className={`group relative block w-full text-left ${
+                  selectionMode ? "cursor-pointer" : "cursor-zoom-in"
+                }`}
+              >
+                <img
+                  src={photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "gallery")}
+                  alt={photo.original_name ?? "group photo"}
+                  loading="lazy"
+                  decoding="async"
+                  sizes="(max-width: 640px) 46vw, (max-width: 1024px) 30vw, 22vw"
+                  className="aspect-square w-full bg-zinc-100 object-cover"
+                />
+                {selectionMode ? (
+                  <span
+                    className={`absolute right-2.5 top-2.5 z-10 grid h-6 w-6 place-items-center rounded-full shadow-[inset_0_0_0_1.5px_rgba(255,255,255,0.98),0_1px_3px_rgba(0,0,0,0.18)] transition ${
+                      selected
+                        ? "bg-teal-600 text-white"
+                        : "bg-white/96 text-transparent"
+                    }`}
+                    aria-hidden="true"
+                  >
+                    <SelectionCheckIcon />
+                  </span>
+                ) : null}
+              </button>
+              <div className="grid gap-1 p-3">
+                <p className="truncate text-sm font-semibold">{photo.original_name ?? "사진"}</p>
+                <p className="text-xs text-zinc-500">{koDate(photo.created_at)}</p>
+                <p className="text-xs text-zinc-500">{formatFileSize(photo.size)}</p>
+              </div>
+            </article>
+          );
+        })}
+      </section>
+
+      {pageCount > 1 ? (
+        <nav className="flex flex-wrap items-center justify-center gap-2" aria-label="사진 페이지">
+          <button
+            type="button"
+            disabled={currentPageIndex === 0}
+            onClick={() => setPageIndex((current) => Math.max(0, current - 1))}
+            className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            이전
+          </button>
+          <span className="text-sm font-medium text-zinc-600">
+            {currentPageIndex + 1} / {pageCount}
+          </span>
+          <button
+            type="button"
+            disabled={currentPageIndex >= pageCount - 1}
+            onClick={() => setPageIndex((current) => Math.min(pageCount - 1, current + 1))}
+            className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            다음
+          </button>
+        </nav>
+      ) : null}
+
+      {viewerIndex !== null && displayPhotos[viewerIndex] ? (
+        <PhotoViewer
+          classNo={classNo}
+          groupId={groupId}
+          access={access}
+          photos={displayPhotos}
+          onPhotoEdited={handlePhotoEdited}
+          onPhotoDeleted={handlePhotoDeleted}
+          index={viewerIndex}
+          onIndexChange={setViewerIndex}
+          onClose={() => setViewerIndex(null)}
+        />
+      ) : null}
+      {batchDeleteDialogOpen ? (
+        <DeleteConfirmDialog
+          title="선택한 파일을 삭제할까요?"
+          formId={batchFormId}
+          onCancel={() => setBatchDeleteDialogOpen(false)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function PhotoViewer({
+  classNo,
+  groupId,
+  access,
+  photos,
+  onPhotoEdited,
+  onPhotoDeleted,
+  index,
+  onIndexChange,
+  onClose,
+}: {
+  classNo: number;
+  groupId: string;
+  access: string;
+  photos: PhotoWithUrl[];
+  onPhotoEdited: (previousPhotoId: string, editedPhoto: Photo, blob: Blob) => void;
+  onPhotoDeleted: (photoId: string) => void;
+  index: number;
+  onIndexChange: (index: number) => void;
+  onClose: () => void;
+}) {
+  const photo = photos[index]!;
+  const currentLabel = `${index + 1} / ${photos.length}`;
+  const displayName = photo.original_name ?? "사진";
+  const displaySize = formatFileSize(photo.size);
+  const viewerPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "viewer");
+  const editorPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "full");
+
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const mobileArrowHideTimeoutRef = useRef<number | null>(null);
+  const activePointers = useRef<Map<number, PointerPoint>>(new Map());
+  const dragStart = useRef<{ pointerId: number; point: PointerPoint; transform: ViewerTransform } | null>(null);
+  const pinchStart = useRef<{ distance: number; center: PointerPoint; transform: ViewerTransform } | null>(null);
+  const pinchInProgress = useRef(false);
+  const touchStart = useRef<PointerPoint | null>(null);
+  const suppressNavigationClick = useRef(false);
+  const cropInteraction = useRef<{
+    pointerId: number;
+    mode: "move" | "resize";
+    handle?: CropHandle;
+    startPoint: PointerPoint;
+    startRect: CropRect;
+  } | null>(null);
+  const [transform, setTransform] = useState<ViewerTransform>({ scale: 1, x: 0, y: 0 });
+  const [cropMode, setCropMode] = useState(false);
+  const [cropRect, setCropRect] = useState<CropRect | null>(null);
+  const [rotation, setRotation] = useState(0);
+  const [loadedImage, setLoadedImage] = useState<(Size & { photoId: string }) | null>(null);
+  const [stageSize, setStageSize] = useState<Size | null>(null);
+  const [saving, setSaving] = useState<"rotate" | "crop" | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [mobileArrowSide, setMobileArrowSide] = useState<MobileArrowSide>(null);
+  const [viewerImage, setViewerImage] = useState<{ photoId: string; src: string }>({
+    photoId: photo.id,
+    src: viewerPhotoUrl,
+  });
+  const [viewerImageState, setViewerImageState] = useState<"loading" | "loaded" | "error">("loading");
+  const imageSize = loadedImage;
+
+  const canMove = photos.length > 1;
+  const viewerReady = viewerImage.photoId === photo.id && viewerImageState === "loaded";
+
+  const clearMobileArrowHideTimeout = useCallback(() => {
+    if (mobileArrowHideTimeoutRef.current !== null) {
+      window.clearTimeout(mobileArrowHideTimeoutRef.current);
+      mobileArrowHideTimeoutRef.current = null;
+    }
+  }, []);
+
+  const scheduleMobileArrowHide = useCallback(() => {
+    if (!isMobileViewerArrowMode()) {
+      return;
+    }
+
+    clearMobileArrowHideTimeout();
+    mobileArrowHideTimeoutRef.current = window.setTimeout(() => {
+      setMobileArrowSide(null);
+      mobileArrowHideTimeoutRef.current = null;
+    }, MOBILE_ARROW_HIDE_DELAY);
+  }, [clearMobileArrowHideTimeout]);
+
+  const updateMobileArrowSide = useCallback((clientX: number) => {
+    if (!isMobileViewerArrowMode()) {
+      setMobileArrowSide(null);
+      return false;
+    }
+
+    const stage = stageRef.current;
+    if (!stage) {
+      return false;
+    }
+
+    const rect = stage.getBoundingClientRect();
+    const leftZoneEnd = rect.left + rect.width / 3;
+    const rightZoneStart = rect.right - rect.width / 3;
+
+    if (clientX <= leftZoneEnd) {
+      setMobileArrowSide("left");
+      scheduleMobileArrowHide();
+      return true;
+    }
+
+    if (clientX >= rightZoneStart) {
+      setMobileArrowSide("right");
+      scheduleMobileArrowHide();
+      return true;
+    }
+
+    clearMobileArrowHideTimeout();
+    setMobileArrowSide(null);
+    return false;
+  }, [clearMobileArrowHideTimeout, scheduleMobileArrowHide]);
+
+  const resetView = useCallback(() => {
+    setTransform({ scale: 1, x: 0, y: 0 });
+    setCropMode(false);
+    setCropRect(null);
+    setRotation(0);
+    activePointers.current.clear();
+    dragStart.current = null;
+    pinchStart.current = null;
+    pinchInProgress.current = false;
+    touchStart.current = null;
+    cropInteraction.current = null;
+    clearMobileArrowHideTimeout();
+    setMobileArrowSide(null);
+  }, [clearMobileArrowHideTimeout]);
+
+  const movePhoto = useCallback(
+    (direction: "prev" | "next") => {
+      if (!canMove || deleting || Boolean(saving)) {
+        return;
+      }
+
+      const nextIndex =
+        direction === "next"
+          ? (index + 1) % photos.length
+          : (index - 1 + photos.length) % photos.length;
+
+      resetView();
+      setDeleteDialogOpen(false);
+      onIndexChange(nextIndex);
+    },
+    [
+      canMove,
+      deleting,
+      index,
+      onIndexChange,
+      photos,
+      resetView,
+      saving,
+    ],
+  );
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (deleteDialogOpen) {
+        if (event.key === "Escape") {
+          setDeleteDialogOpen(false);
+        }
+        return;
+      }
+
+      if (event.key === "Escape") {
+        onClose();
+      }
+      if (event.key === "ArrowRight") {
+        void movePhoto("next");
+      }
+      if (event.key === "ArrowLeft") {
+        void movePhoto("prev");
+      }
+    }
+
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = "";
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [deleteDialogOpen, movePhoto, onClose]);
+
+  useEffect(() => {
+    return () => {
+      clearMobileArrowHideTimeout();
+    };
+  }, [clearMobileArrowHideTimeout]);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+
+    if (!stage) {
+      return;
+    }
+
+    const currentStage = stage;
+
+    function updateStageSize() {
+      setStageSize({ width: currentStage.clientWidth, height: currentStage.clientHeight });
+    }
+
+    updateStageSize();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateStageSize);
+      return () => window.removeEventListener("resize", updateStageSize);
+    }
+
+    const observer = new ResizeObserver(updateStageSize);
+    observer.observe(currentStage);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const abortController = new AbortController();
+    let cancelled = false;
+
+    async function startLoadingCurrentPhoto() {
+      if (!viewerPhotoUrl) {
+        setLoadedImage(null);
+        setViewerImage({ photoId: photo.id, src: "" });
+        setViewerImageState("error");
+        return;
+      }
+
+      if (viewerImage.photoId === photo.id && viewerImage.src === viewerPhotoUrl) {
+        setViewerImageState((current) => (current === "loaded" ? current : "loading"));
+        return;
+      }
+
+      setViewerImageState("loading");
+
+      try {
+        const image = await loadImageElement(viewerPhotoUrl, abortController.signal);
+
+        if (!cancelled) {
+          setLoadedImage({
+            photoId: photo.id,
+            width: image.naturalWidth,
+            height: image.naturalHeight,
+          });
+          setViewerImage({ photoId: photo.id, src: viewerPhotoUrl });
+          setViewerImageState("loaded");
+        }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+
+        if (!cancelled) {
+          setLoadedImage(null);
+          setViewerImage({ photoId: photo.id, src: "" });
+          setViewerImageState("error");
+        }
+      }
+    }
+
+    void Promise.resolve().then(startLoadingCurrentPhoto);
+
+    return () => {
+      cancelled = true;
+      abortController.abort();
+    };
+  }, [photo.id, viewerImage.photoId, viewerImage.src, viewerPhotoUrl]);
+
+  useEffect(() => {
+    if (!shouldPrefetchViewerImages() || photos.length < 2) {
+      return;
+    }
+
+    const prefetchIndexes = new Set<number>([
+      (index + 1) % photos.length,
+      (index + 2) % photos.length,
+      (index - 1 + photos.length) % photos.length,
+    ]);
+
+    for (const targetIndex of prefetchIndexes) {
+      const targetPhoto = photos[targetIndex];
+      if (!targetPhoto || targetPhoto.id === photo.id || targetPhoto.url) {
+        continue;
+      }
+
+      void prefetchViewerImage(
+        imageRouteForPhoto(classNo, groupId, targetPhoto.id, access, "viewer"),
+      ).catch(() => null);
+    }
+  }, [access, classNo, groupId, index, photo.id, photos]);
+
+  const normalizedRotation = ((rotation % 360) + 360) % 360;
+  const rotatedImageSize = useMemo(() => {
+    if (!imageSize) {
+      return null;
+    }
+
+    return normalizedRotation === 90 || normalizedRotation === 270
+      ? { width: imageSize.height, height: imageSize.width }
+      : { width: imageSize.width, height: imageSize.height };
+  }, [imageSize, normalizedRotation]);
+  const hasPendingEdit = cropMode || rotation % 360 !== 0;
+  const currentLayerStyles = useMemo(
+    () =>
+      layerStylesFor(
+        imageSize,
+        stageSize,
+        viewerImage.photoId === photo.id ? rotation : 0,
+        viewerImage.photoId === photo.id ? transform : { scale: 1, x: 0, y: 0 },
+      ),
+    [imageSize, photo.id, rotation, stageSize, transform, viewerImage.photoId],
+  );
+
+  function zoomAt(clientX: number, clientY: number, nextScale: number) {
+    const stage = stageRef.current;
+    if (!stage) {
+      return;
+    }
+
+    const rect = stage.getBoundingClientRect();
+    const pointX = clientX - rect.left - rect.width / 2;
+    const pointY = clientY - rect.top - rect.height / 2;
+    const scale = clamp(nextScale, MIN_SCALE, MAX_SCALE);
+    const ratio = scale / transform.scale;
+
+    setTransform({
+      scale,
+      x: scale === 1 ? 0 : pointX - (pointX - transform.x) * ratio,
+      y: scale === 1 ? 0 : pointY - (pointY - transform.y) * ratio,
+    });
+  }
+
+  function handleWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const delta = event.deltaY > 0 ? 0.88 : 1.12;
+    zoomAt(event.clientX, event.clientY, transform.scale * delta);
+  }
+
+  function pointerDistance(points: PointerPoint[]) {
+    const [first, second] = points;
+    if (!first || !second) {
+      return 0;
+    }
+
+    return Math.hypot(first.x - second.x, first.y - second.y);
+  }
+
+  function pointerCenter(points: PointerPoint[]) {
+    const [first, second] = points;
+    if (!first || !second) {
+      return { x: 0, y: 0 };
+    }
+
+    return {
+      x: (first.x + second.x) / 2,
+      y: (first.y + second.y) / 2,
+    };
+  }
+
+  function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (cropMode) {
+      return;
+    }
+
+    updateMobileArrowSide(event.clientX);
+
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      return;
+    }
+
+    const point = { x: event.clientX, y: event.clientY };
+    activePointers.current.set(event.pointerId, point);
+
+    if (activePointers.current.size === 1) {
+      touchStart.current = point;
+      dragStart.current = {
+        pointerId: event.pointerId,
+        point,
+        transform,
+      };
+    }
+
+    if (activePointers.current.size === 2) {
+      const points = [...activePointers.current.values()];
+      pinchInProgress.current = true;
+      touchStart.current = null;
+      dragStart.current = null;
+      pinchStart.current = {
+        distance: pointerDistance(points),
+        center: pointerCenter(points),
+        transform,
+      };
+    }
+  }
+
+  function handlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (cropMode || !activePointers.current.has(event.pointerId)) {
+      return;
+    }
+
+    if (mobileArrowSide) {
+      scheduleMobileArrowHide();
+    }
+
+    const point = { x: event.clientX, y: event.clientY };
+    activePointers.current.set(event.pointerId, point);
+
+    if (activePointers.current.size >= 2 && pinchStart.current) {
+      const points = [...activePointers.current.values()];
+      const distance = pointerDistance(points);
+      const start = pinchStart.current;
+
+      if (!distance || !start.distance) {
+        return;
+      }
+
+      const center = pointerCenter(points);
+      const nextScale = clamp(start.transform.scale * (distance / start.distance), MIN_SCALE, MAX_SCALE);
+
+      setTransform({
+        scale: nextScale,
+        x: nextScale === 1 ? 0 : start.transform.x + center.x - start.center.x,
+        y: nextScale === 1 ? 0 : start.transform.y + center.y - start.center.y,
+      });
+      return;
+    }
+
+    if (transform.scale > 1 && dragStart.current?.pointerId === event.pointerId) {
+      setTransform({
+        scale: transform.scale,
+        x: dragStart.current.transform.x + point.x - dragStart.current.point.x,
+        y: dragStart.current.transform.y + point.y - dragStart.current.point.y,
+      });
+    }
+  }
+
+  function handlePointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    const start = touchStart.current;
+    const end = { x: event.clientX, y: event.clientY };
+    const wasPinching = pinchInProgress.current;
+    const mobileArrowMode = isMobileViewerArrowMode();
+
+    activePointers.current.delete(event.pointerId);
+    dragStart.current = null;
+    if (activePointers.current.size < 2) {
+      pinchStart.current = null;
+    }
+    if (activePointers.current.size === 0) {
+      pinchInProgress.current = false;
+    }
+
+    if (start && !wasPinching && !cropMode) {
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+
+      if (transform.scale === 1 && Math.abs(dx) > 72 && Math.abs(dx) > Math.abs(dy) * 1.4) {
+        suppressNavigationClick.current = true;
+        void movePhoto(dx < 0 ? "next" : "prev");
+        window.setTimeout(() => {
+          suppressNavigationClick.current = false;
+        }, 250);
+        touchStart.current = null;
+        return;
+      }
+
+      if (canMove && Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+        const stage = stageRef.current;
+
+        if (stage) {
+          const rect = stage.getBoundingClientRect();
+          const direction = mobileArrowMode
+            ? end.x <= rect.left + rect.width / 3
+              ? "prev"
+              : end.x >= rect.right - rect.width / 3
+                ? "next"
+                : null
+            : end.x <= rect.left + rect.width * 0.22
+              ? "prev"
+              : end.x >= rect.right - rect.width * 0.22
+                ? "next"
+                : null;
+
+          if (direction) {
+            suppressNavigationClick.current = true;
+            void movePhoto(direction);
+            if (mobileArrowMode) {
+              setMobileArrowSide(direction === "prev" ? "left" : "right");
+              scheduleMobileArrowHide();
+            }
+            window.setTimeout(() => {
+              suppressNavigationClick.current = false;
+            }, 250);
+            touchStart.current = null;
+            return;
+          }
+        }
+      }
+    }
+
+    if (mobileArrowSide) {
+      scheduleMobileArrowHide();
+    }
+
+    touchStart.current = null;
+  }
+
+  function imageBoundsForSize(size: Size): ImageBounds | null {
+    const stage = stageRef.current;
+
+    if (!stage) {
+      return null;
+    }
+
+    const rect = stage.getBoundingClientRect();
+    const renderedRatio = Math.min(rect.width / size.width, rect.height / size.height);
+    const width = size.width * renderedRatio;
+    const height = size.height * renderedRatio;
+
+    return {
+      x: (rect.width - width) / 2,
+      y: (rect.height - height) / 2,
+      width,
+      height,
+      renderedRatio,
+    };
+  }
+
+  function getImageBounds() {
+    return rotatedImageSize ? imageBoundsForSize(rotatedImageSize) : null;
+  }
+
+  function rotateCropRectCounterClockwise(rect: CropRect, oldBounds: ImageBounds, nextBounds: ImageBounds): CropRect {
+    const left = clamp((rect.x - oldBounds.x) / oldBounds.width, 0, 1);
+    const top = clamp((rect.y - oldBounds.y) / oldBounds.height, 0, 1);
+    const right = clamp((rect.x + rect.width - oldBounds.x) / oldBounds.width, 0, 1);
+    const bottom = clamp((rect.y + rect.height - oldBounds.y) / oldBounds.height, 0, 1);
+    const nextLeft = top;
+    const nextTop = 1 - right;
+    const nextRight = bottom;
+    const nextBottom = 1 - left;
+    const width = Math.min(nextBounds.width, Math.max(MIN_CROP_SIZE, (nextRight - nextLeft) * nextBounds.width));
+    const height = Math.min(nextBounds.height, Math.max(MIN_CROP_SIZE, (nextBottom - nextTop) * nextBounds.height));
+
+    return {
+      x: clamp(nextBounds.x + nextLeft * nextBounds.width, nextBounds.x, nextBounds.x + nextBounds.width - width),
+      y: clamp(nextBounds.y + nextTop * nextBounds.height, nextBounds.y, nextBounds.y + nextBounds.height - height),
+      width,
+      height,
+    };
+  }
+
+  function initialCropRect() {
+    const bounds = getImageBounds();
+
+    if (!bounds) {
+      return null;
+    }
+
+    const width = Math.max(MIN_CROP_SIZE, bounds.width * 0.72);
+    const height = Math.max(MIN_CROP_SIZE, bounds.height * 0.72);
+
+    return {
+      x: bounds.x + (bounds.width - width) / 2,
+      y: bounds.y + (bounds.height - height) / 2,
+      width,
+      height,
+    };
+  }
+
+  function resetCropSelection() {
+    setCropRect(initialCropRect());
+  }
+
+  useEffect(() => {
+    if (cropMode && !cropRect) {
+      window.requestAnimationFrame(resetCropSelection);
+    }
+  });
+
+  function startCropMode() {
+    setTransform({ scale: 1, x: 0, y: 0 });
+    activePointers.current.clear();
+    dragStart.current = null;
+    pinchStart.current = null;
+    touchStart.current = null;
+    setCropMode(true);
+    window.requestAnimationFrame(resetCropSelection);
+  }
+
+  function rotateCounterClockwise() {
+    const oldBounds = getImageBounds();
+    const nextRotatedImageSize = rotatedImageSize
+      ? { width: rotatedImageSize.height, height: rotatedImageSize.width }
+      : null;
+    const nextBounds = nextRotatedImageSize ? imageBoundsForSize(nextRotatedImageSize) : null;
+
+    setTransform({ scale: 1, x: 0, y: 0 });
+    cropInteraction.current = null;
+    setRotation((current) => current - 90);
+    if (cropMode && cropRect && oldBounds && nextBounds) {
+      setCropRect(rotateCropRectCounterClockwise(cropRect, oldBounds, nextBounds));
+    } else if (cropMode) {
+      window.requestAnimationFrame(resetCropSelection);
+    }
+  }
+
+  function cancelPendingEdit() {
+    setTransform({ scale: 1, x: 0, y: 0 });
+    activePointers.current.clear();
+    dragStart.current = null;
+    pinchStart.current = null;
+    pinchInProgress.current = false;
+    touchStart.current = null;
+    cropInteraction.current = null;
+
+    if (cropMode) {
+      setCropMode(false);
+      setCropRect(null);
+      return;
+    }
+
+    setRotation(0);
+  }
+
+  function cropPointer(event: ReactPointerEvent<HTMLElement>) {
+    const stage = stageRef.current;
+
+    if (!stage) {
+      return { x: event.clientX, y: event.clientY };
+    }
+
+    const rect = stage.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  }
+
+  function handleCropPointerDown(
+    event: ReactPointerEvent<HTMLElement>,
+    mode: "move" | "resize",
+    handle?: CropHandle,
+  ) {
+    if (!cropRect) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    cropInteraction.current = {
+      pointerId: event.pointerId,
+      mode,
+      handle,
+      startPoint: cropPointer(event),
+      startRect: cropRect,
+    };
+  }
+
+  function handleCropPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const interaction = cropInteraction.current;
+
+    if (!interaction || interaction.pointerId !== event.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const bounds = getImageBounds();
+    const point = cropPointer(event);
+
+    if (!bounds) {
+      return;
+    }
+
+    const dx = point.x - interaction.startPoint.x;
+    const dy = point.y - interaction.startPoint.y;
+    const start = interaction.startRect;
+
+    if (interaction.mode === "move") {
+      setCropRect({
+        ...start,
+        x: clamp(start.x + dx, bounds.x, bounds.x + bounds.width - start.width),
+        y: clamp(start.y + dy, bounds.y, bounds.y + bounds.height - start.height),
+      });
+      return;
+    }
+
+    const handle = interaction.handle ?? "se";
+    let left = start.x;
+    let top = start.y;
+    let right = start.x + start.width;
+    let bottom = start.y + start.height;
+
+    if (handle.includes("w")) {
+      left = clamp(start.x + dx, bounds.x, right - MIN_CROP_SIZE);
+    }
+    if (handle.includes("e")) {
+      right = clamp(start.x + start.width + dx, left + MIN_CROP_SIZE, bounds.x + bounds.width);
+    }
+    if (handle.includes("n")) {
+      top = clamp(start.y + dy, bounds.y, bottom - MIN_CROP_SIZE);
+    }
+    if (handle.includes("s")) {
+      bottom = clamp(start.y + start.height + dy, top + MIN_CROP_SIZE, bounds.y + bounds.height);
+    }
+
+    setCropRect({ x: left, y: top, width: right - left, height: bottom - top });
+  }
+
+  function handleCropPointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    if (cropInteraction.current?.pointerId === event.pointerId) {
+      event.preventDefault();
+      event.stopPropagation();
+      cropInteraction.current = null;
+    }
+  }
+
+  async function uploadEditedPhoto(blob: Blob) {
+    const formData = new FormData();
+    formData.append("classNo", String(classNo));
+    formData.append("groupId", groupId);
+    formData.append("access", access);
+    formData.append("photoId", photo.id);
+    formData.append("photo", new File([blob], photo.original_name ?? `photo-${index + 1}`, { type: blob.type }));
+
+    const response = await fetch("/api/photos/edit", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as EditedPhotoResponse | null;
+      throw new Error(body?.error ?? "편집한 사진 저장에 실패했습니다.");
+    }
+
+    const body = (await response.json().catch(() => null)) as EditedPhotoResponse | null;
+    if (!body?.photo) {
+      throw new Error("편집한 사진 정보를 확인할 수 없습니다.");
+    }
+
+    onPhotoEdited(photo.id, body.photo, blob);
+    setSaving(null);
+    setCropMode(false);
+    setCropRect(null);
+    setRotation(0);
+    setTransform({ scale: 1, x: 0, y: 0 });
+  }
+
+  async function createRotatedCanvas() {
+    const image = await loadImageElement(editorPhotoUrl);
+    const canvas = document.createElement("canvas");
+
+    if (normalizedRotation === 90 || normalizedRotation === 270) {
+      canvas.width = image.naturalHeight;
+      canvas.height = image.naturalWidth;
+    } else {
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+    }
+
+    const context = canvas.getContext("2d");
+
+    if (!context) {
+      throw new Error("사진을 편집할 수 없습니다.");
+    }
+
+    if (normalizedRotation === 90) {
+      context.translate(canvas.width, 0);
+      context.rotate(Math.PI / 2);
+    } else if (normalizedRotation === 180) {
+      context.translate(canvas.width, canvas.height);
+      context.rotate(Math.PI);
+    } else if (normalizedRotation === 270) {
+      context.translate(0, canvas.height);
+      context.rotate(-Math.PI / 2);
+    }
+
+    context.drawImage(image, 0, 0);
+    return canvas;
+  }
+
+  async function saveRotatedCounterClockwise() {
+    try {
+      setSaving("rotate");
+      const canvas = await createRotatedCanvas();
+      await uploadEditedPhoto(await canvasToBlob(canvas, photo.mime_type));
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "사진 저장에 실패했습니다.");
+      setSaving(null);
+    }
+  }
+
+  async function saveCrop() {
+    if (!cropMode) {
+      startCropMode();
+      return;
+    }
+
+    try {
+      setSaving("crop");
+      const stage = stageRef.current;
+
+      if (!stage) {
+        throw new Error("크롭 영역을 확인할 수 없습니다.");
+      }
+
+      const editedCanvas = await createRotatedCanvas();
+      const bounds = imageBoundsForSize({
+        width: editedCanvas.width,
+        height: editedCanvas.height,
+      });
+
+      if (!bounds || !cropRect) {
+        throw new Error("크롭 영역을 확인할 수 없습니다.");
+      }
+
+      const sourceX = clamp((cropRect.x - bounds.x) / bounds.renderedRatio, 0, editedCanvas.width);
+      const sourceY = clamp((cropRect.y - bounds.y) / bounds.renderedRatio, 0, editedCanvas.height);
+      const sourceWidth = clamp(cropRect.width / bounds.renderedRatio, 1, editedCanvas.width - sourceX);
+      const sourceHeight = clamp(cropRect.height / bounds.renderedRatio, 1, editedCanvas.height - sourceY);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(sourceWidth);
+      canvas.height = Math.round(sourceHeight);
+      const context = canvas.getContext("2d");
+
+      if (!context) {
+        throw new Error("사진을 편집할 수 없습니다.");
+      }
+
+      drawCoverImage(
+        context,
+        editedCanvas,
+        { x: sourceX, y: sourceY, width: sourceWidth, height: sourceHeight },
+        canvas.width,
+        canvas.height,
+      );
+
+      await uploadEditedPhoto(await canvasToBlob(canvas, photo.mime_type));
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "사진 저장에 실패했습니다.");
+      setSaving(null);
+    }
+  }
+
+  async function saveEdit() {
+    if (cropMode) {
+      await saveCrop();
+      return;
+    }
+
+    if (rotation % 360 !== 0) {
+      await saveRotatedCounterClockwise();
+    }
+  }
+
+  async function deleteCurrentPhoto() {
+    try {
+      setDeleting(true);
+
+      const response = await fetch("/api/photos/delete", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          classNo,
+          groupId,
+          access,
+          photoId: photo.id,
+        }),
+      });
+
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as DeletePhotoResponse | null;
+        throw new Error(body?.error ?? "사진 삭제에 실패했습니다.");
+      }
+
+      setDeleteDialogOpen(false);
+      onPhotoDeleted(photo.id);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "사진 삭제에 실패했습니다.");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 z-50 grid grid-rows-[auto_1fr_auto] bg-black text-white"
+    >
+      <header className="z-10 flex min-h-16 items-start justify-between gap-3 bg-black/88 px-4 py-3">
+        <div className="min-w-0 pt-0.5">
+          <p className="text-sm font-semibold">{currentLabel}</p>
+          <p className="truncate text-sm text-zinc-300">{displayName} · {displaySize}</p>
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="닫기"
+          className="mt-[1.35rem] shrink-0 px-1 text-[13px] font-medium leading-none text-zinc-300 hover:text-white"
+        >
+          닫기
+        </button>
+      </header>
+
+      <div
+        ref={stageRef}
+        onWheel={handleWheel}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        className="relative min-h-0 overflow-hidden touch-none select-none bg-black"
+      >
+        <button
+          type="button"
+          aria-label="이전 사진"
+          disabled={!canMove || cropMode || deleting || Boolean(saving)}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={() => {
+            if (!cropMode && !suppressNavigationClick.current) {
+              void movePhoto("prev");
+            }
+          }}
+          className="absolute left-4 top-1/2 z-20 hidden h-11 w-11 -translate-y-1/2 cursor-pointer appearance-none items-center justify-center rounded-full border border-white/18 bg-black/60 text-white shadow-[0_10px_24px_rgba(0,0,0,0.28)] backdrop-blur-[2px] transition hover:bg-black/72 disabled:cursor-not-allowed disabled:opacity-35 sm:inline-flex"
+        >
+          <ViewerPrevIcon />
+        </button>
+        <button
+          type="button"
+          aria-label="다음 사진"
+          disabled={!canMove || cropMode || deleting || Boolean(saving)}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={() => {
+            if (!cropMode && !suppressNavigationClick.current) {
+              void movePhoto("next");
+            }
+          }}
+          className="absolute right-4 top-1/2 z-20 hidden h-11 w-11 -translate-y-1/2 cursor-pointer appearance-none items-center justify-center rounded-full border border-white/18 bg-black/60 text-white shadow-[0_10px_24px_rgba(0,0,0,0.28)] backdrop-blur-[2px] transition hover:bg-black/72 disabled:cursor-not-allowed disabled:opacity-35 sm:inline-flex"
+        >
+          <ViewerNextIcon />
+        </button>
+        <button
+          type="button"
+          aria-label="이전 사진"
+          disabled={!canMove || cropMode || deleting || Boolean(saving)}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={() => {
+            if (!cropMode && !suppressNavigationClick.current) {
+              void movePhoto("prev");
+            }
+          }}
+          className={`absolute left-3 top-1/2 z-20 inline-flex h-11 w-11 -translate-y-1/2 cursor-pointer appearance-none items-center justify-center rounded-full border border-white/18 bg-black/60 text-white shadow-[0_10px_24px_rgba(0,0,0,0.28)] backdrop-blur-[2px] transition-[transform,opacity,background-color] duration-200 ease-out hover:bg-black/72 disabled:cursor-not-allowed disabled:opacity-35 sm:hidden ${
+            mobileArrowSide === "left"
+              ? "pointer-events-auto translate-x-0 opacity-100"
+              : "-translate-x-[175%] opacity-0 pointer-events-none"
+          }`}
+        >
+          <ViewerPrevIcon />
+        </button>
+        <button
+          type="button"
+          aria-label="다음 사진"
+          disabled={!canMove || cropMode || deleting || Boolean(saving)}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={() => {
+            if (!cropMode && !suppressNavigationClick.current) {
+              void movePhoto("next");
+            }
+          }}
+          className={`absolute right-3 top-1/2 z-20 inline-flex h-11 w-11 -translate-y-1/2 cursor-pointer appearance-none items-center justify-center rounded-full border border-white/18 bg-black/60 text-white shadow-[0_10px_24px_rgba(0,0,0,0.28)] backdrop-blur-[2px] transition-[transform,opacity,background-color] duration-200 ease-out hover:bg-black/72 disabled:cursor-not-allowed disabled:opacity-35 sm:hidden ${
+            mobileArrowSide === "right"
+              ? "pointer-events-auto translate-x-0 opacity-100"
+              : "translate-x-[175%] opacity-0 pointer-events-none"
+          }`}
+        >
+          <ViewerNextIcon />
+        </button>
+
+        <div
+          aria-hidden="true"
+          className={`pointer-events-none absolute inset-0 ${
+            viewerImage.src && currentLayerStyles ? "opacity-100" : "opacity-0"
+          }`}
+        >
+          <div
+            className="absolute left-1/2 top-1/2 will-change-transform"
+            style={currentLayerStyles?.containerStyle}
+          >
+            {viewerImage.src ? (
+              <img
+                ref={imageRef}
+                src={viewerImage.src}
+                alt=""
+                loading="eager"
+                decoding="async"
+                fetchPriority="high"
+                draggable={false}
+                onLoad={(event) => {
+                  const image = event.currentTarget;
+                  if (!image.naturalWidth || !image.naturalHeight) {
+                    return;
+                  }
+
+                  setLoadedImage({
+                    photoId: viewerImage.photoId,
+                    width: image.naturalWidth,
+                    height: image.naturalHeight,
+                  });
+                  setViewerImageState("loaded");
+                }}
+                onError={() => {
+                  setViewerImageState("error");
+                  setLoadedImage(null);
+                  setViewerImage({ photoId: photo.id, src: "" });
+                }}
+                className="absolute left-1/2 top-1/2 max-w-none object-contain"
+                style={currentLayerStyles?.imageStyle}
+              />
+            ) : null}
+          </div>
+        </div>
+
+        {!viewerImage.src && viewerImageState === "error" ? (
+          <div className="grid h-full place-items-center text-sm text-zinc-400">사진을 불러올 수 없습니다.</div>
+        ) : (
+          null
+        )}
+
+        {cropMode && cropRect ? (
+          <div
+            className="absolute inset-0 z-30 bg-black/22"
+            onPointerMove={handleCropPointerMove}
+            onPointerUp={handleCropPointerUp}
+            onPointerCancel={handleCropPointerUp}
+          >
+            <div
+              className="absolute border-2 border-white shadow-[0_0_0_9999px_rgba(0,0,0,0.38)]"
+              style={{
+                left: cropRect.x,
+                top: cropRect.y,
+                width: cropRect.width,
+                height: cropRect.height,
+              }}
+            >
+              <button
+                type="button"
+                aria-label="크롭 영역 이동"
+                onPointerDown={(event) => handleCropPointerDown(event, "move")}
+                className="absolute inset-0 cursor-move bg-transparent"
+              />
+              {(["nw", "ne", "sw", "se"] as const).map((handle) => (
+                <button
+                  key={handle}
+                  type="button"
+                  aria-label="크롭 영역 크기 조정"
+                  onPointerDown={(event) => handleCropPointerDown(event, "resize", handle)}
+                  className={`absolute h-5 w-5 rounded-full border-2 border-black bg-white shadow ${
+                    handle === "nw"
+                      ? "-left-3 -top-3 cursor-nw-resize"
+                      : handle === "ne"
+                        ? "-right-3 -top-3 cursor-ne-resize"
+                        : handle === "sw"
+                          ? "-bottom-3 -left-3 cursor-sw-resize"
+                          : "-bottom-3 -right-3 cursor-se-resize"
+                  }`}
+                />
+              ))}
+              {(["n", "s", "w", "e"] as const).map((handle) => (
+                <button
+                  key={handle}
+                  type="button"
+                  aria-label="크롭 영역 크기 조정"
+                  onPointerDown={(event) => handleCropPointerDown(event, "resize", handle)}
+                  className={`absolute rounded-full bg-white/90 ${
+                    handle === "n"
+                      ? "-top-2 left-1/2 h-4 w-10 -translate-x-1/2 cursor-n-resize"
+                      : handle === "s"
+                        ? "-bottom-2 left-1/2 h-4 w-10 -translate-x-1/2 cursor-s-resize"
+                        : handle === "w"
+                          ? "-left-2 top-1/2 h-10 w-4 -translate-y-1/2 cursor-w-resize"
+                          : "-right-2 top-1/2 h-10 w-4 -translate-y-1/2 cursor-e-resize"
+                  }`}
+                />
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+      </div>
+
+      <footer className="z-10 flex min-h-16 w-full items-center gap-2 bg-black/88 px-3 py-3">
+        <div className="flex min-w-0 flex-1 flex-nowrap items-center justify-start gap-2 overflow-x-auto">
+          <button
+            type="button"
+            aria-label="회전"
+            disabled={Boolean(saving) || deleting || !viewerReady}
+            onClick={rotateCounterClockwise}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-white disabled:text-zinc-950 disabled:opacity-100 sm:w-auto sm:px-3"
+          >
+            <RotateIcon />
+            <span className="hidden sm:inline">회전</span>
+          </button>
+          <button
+            type="button"
+            aria-label="자르기"
+            disabled={Boolean(saving) || deleting || !viewerReady || cropMode}
+            onClick={startCropMode}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-white disabled:text-zinc-950 disabled:opacity-100 sm:w-auto sm:px-3"
+          >
+            <CropIcon />
+            <span className="hidden sm:inline">자르기</span>
+          </button>
+          <button
+            type="button"
+            aria-label="취소"
+            disabled={Boolean(saving) || deleting || !hasPendingEdit}
+            onClick={cancelPendingEdit}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400 sm:w-auto sm:px-3"
+          >
+            <CloseIcon />
+            <span className="hidden sm:inline">취소</span>
+          </button>
+          <button
+            type="button"
+            aria-label={saving ? "저장 중" : "저장"}
+            disabled={Boolean(saving) || deleting || !viewerReady || !hasPendingEdit}
+            onClick={saveEdit}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400 sm:w-auto sm:px-3"
+          >
+            <SaveIcon />
+            <span className="hidden sm:inline">{saving ? "저장 중" : "저장"}</span>
+          </button>
+        </div>
+        <div className="shrink-0">
+          <button
+            type="button"
+            aria-label="삭제"
+            disabled={Boolean(saving) || deleting || !viewerReady}
+            onClick={() => setDeleteDialogOpen(true)}
+            className="inline-flex h-10 w-10 items-center justify-center gap-1.5 rounded-md border border-red-300 bg-red-50 px-0 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:border-red-300 disabled:bg-red-50 disabled:text-red-700 disabled:opacity-100 sm:w-auto sm:px-3"
+          >
+            <TrashIcon />
+            <span className="hidden sm:inline">삭제</span>
+          </button>
+        </div>
+      </footer>
+      {deleteDialogOpen ? (
+        <DeleteConfirmDialog
+          title="이 파일을 삭제할까요?"
+          onConfirm={deleteCurrentPhoto}
+          confirmDisabled={deleting}
+          onCancel={() => setDeleteDialogOpen(false)}
+        />
+      ) : null}
+    </div>
+  );
+}
