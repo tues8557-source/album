@@ -2,8 +2,8 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "학급 그룹 사진첩",
-  description: "학급 그룹별 사진첩",
+  title: "학교배경 컨셉사진",
+  description: "매안초 졸업앨범 촬영 준비",
   formatDetection: {
     telephone: false,
     date: false,
