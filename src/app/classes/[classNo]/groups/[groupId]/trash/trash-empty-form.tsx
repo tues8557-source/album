@@ -7,11 +7,9 @@ import { DeleteConfirmDialog } from "@/app/delete-confirm-dialog";
 export function TrashEmptyForm({
   classNo,
   groupId,
-  access,
 }: {
   classNo: number;
   groupId: string;
-  access: string;
 }) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const formId = `trash-empty-${groupId}`;
@@ -25,7 +23,6 @@ export function TrashEmptyForm({
       >
         <input type="hidden" name="classNo" value={classNo} />
         <input type="hidden" name="groupId" value={groupId} />
-        <input type="hidden" name="access" value={access} />
         <button
           type="button"
           onClick={() => setDialogOpen(true)}

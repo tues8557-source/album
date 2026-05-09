@@ -1,35 +1,13 @@
-import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
-import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
+import { getGroupAccessState } from "@/lib/auth";
 import { createServiceSupabase } from "@/lib/supabase/server";
-
-async function canAccessGroup(classNo: number, groupId: string, access: string) {
-  const supabase = createServiceSupabase();
-  const { data: group, error } = await supabase
-    .from("groups")
-    .select("*")
-    .eq("id", groupId)
-    .eq("class_no", classNo)
-    .is("deleted_at", null)
-    .single();
-
-  if (error || !group) {
-    return false;
-  }
-
-  const store = await cookies();
-  const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  const groupSession = hasValidGroupAccessToken(access, groupId, group.access_nonce);
-  return admin || !group.password_hash || groupSession;
-}
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const classNo = Number.parseInt(searchParams.get("classNo") ?? "", 10);
   const groupId = String(searchParams.get("groupId") ?? "").trim();
-  const access = String(searchParams.get("access") ?? "").trim();
 
-  if (!classNo || !groupId || !(await canAccessGroup(classNo, groupId, access))) {
+  if (!classNo || !groupId || !(await getGroupAccessState(classNo, groupId)).allowed) {
     return NextResponse.json({ error: "권한을 확인할 수 없습니다." }, { status: 403 });
   }
 

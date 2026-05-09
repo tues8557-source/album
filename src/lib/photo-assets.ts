@@ -4,20 +4,17 @@ export function photoAssetUrl({
   classNo,
   groupId,
   photoId,
-  access,
   variant,
 }: {
   classNo: number;
   groupId: string;
   photoId: string;
-  access: string;
   variant: PhotoAssetVariant;
 }) {
   const params = new URLSearchParams({
     classNo: String(classNo),
     groupId,
     photoId,
-    access,
     variant,
   });
 

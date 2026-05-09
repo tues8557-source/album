@@ -1,7 +1,7 @@
-import { CLASS_NUMBERS } from "./types";
+import { DEFAULT_CLASS_COUNT } from "./types";
 
-export function isClassNumber(value: number): boolean {
-  return CLASS_NUMBERS.includes(value as (typeof CLASS_NUMBERS)[number]);
+export function isClassNumber(value: number, classCount = DEFAULT_CLASS_COUNT): boolean {
+  return Number.isInteger(value) && value >= 1 && value <= classCount;
 }
 
 export function groupLetter(index: number): string {

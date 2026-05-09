@@ -1,11 +1,10 @@
-import { cookies } from "next/headers";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { PhotoGallery } from "@/app/classes/[classNo]/groups/[groupId]/photo-gallery";
 import { PhotoUploadForm } from "@/app/classes/[classNo]/groups/[groupId]/photo-upload-form";
-import { getClassGroups, getGroup, getGroupMembers, getPhotos } from "@/lib/data";
+import { getGroupAccessState } from "@/lib/auth";
+import { getClassGroups, getGroupMembers, getPhotos } from "@/lib/data";
 import { genderClass, groupName } from "@/lib/format";
-import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
 
 export const dynamic = "force-dynamic";
 
@@ -18,42 +17,18 @@ function staleGroupHomePath(classNo: number, groupId: string) {
   return `/?${params.toString()}`;
 }
 
-async function getGroupAccessState(
-  groupId: string,
-  passwordHash: string | null,
-  accessNonce: string | null,
-  access: string,
-) {
-  if (!passwordHash) {
-    return "granted" as const;
-  }
-
-  const store = await cookies();
-  const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  if (admin) {
-    return "granted" as const;
-  }
-
-  if (!access) {
-    return "prompt" as const;
-  }
-
-  return hasValidGroupAccessToken(access, groupId, accessNonce)
-    ? "granted" as const
-    : "stale" as const;
-}
-
 export default async function GroupPage({
   params,
   searchParams,
 }: {
   params: Promise<{ classNo: string; groupId: string }>;
-  searchParams: Promise<{ error?: string; access?: string }>;
+  searchParams: Promise<{ error?: string }>;
 }) {
   const { classNo: classNoParam, groupId } = await params;
-  const { error, access = "" } = await searchParams;
+  const { error } = await searchParams;
   const classNo = Number.parseInt(classNoParam, 10);
-  const group = await getGroup(groupId);
+  const accessState = await getGroupAccessState(classNo, groupId);
+  const group = accessState.group;
 
   if (!group || group.class_no !== classNo) {
     notFound();
@@ -62,18 +37,12 @@ export default async function GroupPage({
   const { groups } = await getClassGroups(classNo);
   const currentGroup = groups.find((item) => item.id === groupId);
   const label = currentGroup ? groupName(classNo, Math.max(0, currentGroup.sort_order - 1)) : "그룹";
-  const accessState = await getGroupAccessState(
-    groupId,
-    group.password_hash,
-    group.access_nonce,
-    access,
-  );
 
-  if (accessState === "stale") {
+  if (accessState.stale) {
     redirect(staleGroupHomePath(classNo, groupId));
   }
 
-  if (accessState === "prompt") {
+  if (accessState.prompt) {
     return (
       <main className="min-h-screen bg-stone-50 px-4 py-8 text-zinc-950">
         <section className="mx-auto max-w-sm rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
@@ -124,7 +93,7 @@ export default async function GroupPage({
             </div>
           </div>
           <Link
-            href={`/classes/${classNo}/groups/${groupId}/trash?access=${encodeURIComponent(access)}`}
+            href={`/classes/${classNo}/groups/${groupId}/trash`}
             className="shrink-0 whitespace-nowrap rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold"
           >
             휴지통
@@ -136,11 +105,11 @@ export default async function GroupPage({
           {error === "bad-photo" ? (
             <p className="mt-2 text-sm text-red-600">이미지 파일만 업로드할 수 있습니다.</p>
           ) : null}
-          <PhotoUploadForm classNo={classNo} groupId={groupId} access={access} />
+          <PhotoUploadForm classNo={classNo} groupId={groupId} />
         </section>
 
         {photos.length ? (
-          <PhotoGallery classNo={classNo} groupId={groupId} access={access} photos={photos} />
+          <PhotoGallery classNo={classNo} groupId={groupId} photos={photos} />
         ) : (
           <p className="rounded-lg border border-dashed border-zinc-300 bg-white p-5 text-center text-sm text-zinc-500">
             아직 사진이 없습니다.

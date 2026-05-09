@@ -1,12 +1,21 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent, ReactNode } from "react";
+import { ActionStatusButton } from "@/app/ui/action-status-button";
 import { TrashIcon } from "@/app/ui/icons";
+import { useHorizontalDragScroll } from "@/lib/use-horizontal-drag-scroll";
+import { useConfirmDialog } from "@/lib/use-confirm-dialog";
 import {
-  CLASS_NUMBERS,
-  type ClassNumber,
+  measureTabStripPages,
+  pageIndexForItemIndex,
+  pageIndexForScrollLeft,
+  tabStripPagesEqual,
+  type TabStripPage,
+} from "@/lib/tab-strip-pages";
+import {
   type Group,
   type GroupMember,
   type Student,
@@ -31,6 +40,17 @@ type SaveResult = {
 
 type GroupActionResult = {
   groups?: Group[];
+};
+
+type GroupPasswordActionResult = {
+  group?: Group | null;
+};
+
+type ClassCountActionResult = {
+  classCount?: number;
+  classNumbers?: number[];
+  currentClassNo?: number;
+  minimumClassCount?: number;
 };
 
 type PickerPosition = {
@@ -83,16 +103,12 @@ function groupIdFromText(value: string, groups: Group[]) {
   return groups.find((group) => group.id === value.trim())?.id ?? "";
 }
 
-function visiblePassword(value: string | null) {
-  if (!value) {
-    return "";
-  }
-
-  return /^[a-f0-9]{64}$/i.test(value) ? "" : value;
-}
-
 function groupDisplayName(classNo: number, group: Group) {
   return groupName(classNo, Math.max(0, group.sort_order - 1));
+}
+
+function groupHasPassword(group: Group) {
+  return group.has_password ?? Boolean(group.password_hash);
 }
 
 function initialRows(students: Student[], groups: Group[], members: GroupMember[]) {
@@ -152,34 +168,43 @@ function StableButtonLabel({
 
 export function StudentSpreadsheet({
   action,
+  classCountAction,
   groupCountAction,
   deleteEmptyGroupsAction,
-  compactGroupNamesAction,
   clearClassGroupAssignmentsAction,
   deleteClassStudentsAction,
+  bulkPasswordAction,
   passwordAction,
   updateStudentGroupAction,
   classNo,
+  classNumbers,
   classStudentCounts,
   students,
   groups,
   members,
 }: {
   action: (formData: FormData) => SaveResult | void | Promise<SaveResult | void>;
+  classCountAction: (formData: FormData) => ClassCountActionResult | void | Promise<ClassCountActionResult | void>;
   groupCountAction: (formData: FormData) => GroupActionResult | void | Promise<GroupActionResult | void>;
   deleteEmptyGroupsAction: (formData: FormData) => GroupActionResult | void | Promise<GroupActionResult | void>;
-  compactGroupNamesAction: (formData: FormData) => GroupActionResult | void | Promise<GroupActionResult | void>;
   clearClassGroupAssignmentsAction: (formData: FormData) => void | Promise<void>;
   deleteClassStudentsAction: (formData: FormData) => void | Promise<void>;
-  passwordAction: (formData: FormData) => void | Promise<void>;
+  bulkPasswordAction: (formData: FormData) => GroupActionResult | void | Promise<GroupActionResult | void>;
+  passwordAction: (formData: FormData) => GroupPasswordActionResult | void | Promise<GroupPasswordActionResult | void>;
   updateStudentGroupAction: (formData: FormData) => void | Promise<void>;
   classNo: number;
-  classStudentCounts: Record<ClassNumber, number>;
+  classNumbers: number[];
+  classStudentCounts: Record<number, number>;
   students: Student[];
   groups: Group[];
   members: GroupMember[];
 }) {
+  const router = useRouter();
   const formRef = useRef<HTMLFormElement>(null);
+  const deleteStudentsFormRef = useRef<HTMLFormElement>(null);
+  const classTabsRef = useRef<HTMLElement | null>(null);
+  const { dragHandlers: classTabDragHandlers, dragging: classTabsDragging } = useHorizontalDragScroll(classTabsRef);
+  const { confirm, confirmDialog } = useConfirmDialog();
   const saveTimerRef = useRef<number | null>(null);
   const savePromiseRef = useRef<Promise<void> | null>(null);
   const saveNoticeTimerRef = useRef<number | null>(null);
@@ -189,12 +214,21 @@ export function StudentSpreadsheet({
   const groupCountButtonRef = useRef<HTMLButtonElement | null>(null);
   const [rows, setRows] = useState(() => initialRows(students, groups, members));
   const [groupsState, setGroupsState] = useState(groups);
+  const [classNumbersState, setClassNumbersState] = useState(classNumbers);
+  const [classStudentCountsState, setClassStudentCountsState] = useState(classStudentCounts);
+  const [classCountInput, setClassCountInput] = useState(() => String(classNumbers.length));
+  const [classTabPages, setClassTabPages] = useState<TabStripPage[]>([
+    { endIndex: classNumbers.length, scrollLeft: 0, startIndex: 0 },
+  ]);
+  const [visibleClassPageIndex, setVisibleClassPageIndex] = useState(0);
   const [selectedRowIndex, setSelectedRowIndex] = useState<number | null>(null);
   const [visiblePasswordGroups, setVisiblePasswordGroups] = useState<Set<string>>(new Set());
+  const [bulkPasswordVisible, setBulkPasswordVisible] = useState(false);
   const [actionFeedback, setActionFeedback] = useState<Record<string, ActionFeedbackState>>({});
   const [deletingRowKeys, setDeletingRowKeys] = useState<Set<string>>(new Set());
   const [groupCountPickerOpen, setGroupCountPickerOpen] = useState(false);
   const [groupCountPickerPosition, setGroupCountPickerPosition] = useState<PickerPosition | null>(null);
+  const [classCountWarning, setClassCountWarning] = useState("");
   const [groupCountWarning, setGroupCountWarning] = useState("");
   const [saveNotice, setSaveNotice] = useState("");
   const [hasPendingSave, setHasPendingSave] = useState(false);
@@ -202,6 +236,79 @@ export function StudentSpreadsheet({
     () => rows.filter((row) => row.name.trim() && !row.deleted),
     [rows],
   );
+  const activeCount = activeRows.length;
+  const measureClassTabPages = useCallback(() => {
+    const container = classTabsRef.current;
+
+    if (!container) {
+      return;
+    }
+
+    const nextPages = measureTabStripPages(container);
+
+    setClassTabPages((current) => (tabStripPagesEqual(current, nextPages) ? current : nextPages));
+    setVisibleClassPageIndex((current) => {
+      const nextPageIndex = pageIndexForScrollLeft(
+        nextPages,
+        container.scrollLeft,
+        Math.max(0, container.scrollWidth - container.clientWidth),
+      );
+      return current === nextPageIndex ? current : nextPageIndex;
+    });
+  }, []);
+
+  function syncVisibleClassPageFromScroll(container: HTMLElement | null = classTabsRef.current) {
+    if (!container || !classTabPages.length) {
+      return;
+    }
+
+    const nextPageIndex = pageIndexForScrollLeft(
+      classTabPages,
+      container.scrollLeft,
+      Math.max(0, container.scrollWidth - container.clientWidth),
+    );
+    setVisibleClassPageIndex((current) => (current === nextPageIndex ? current : nextPageIndex));
+  }
+
+  function scrollClassTabsToPage(pageIndex: number, behavior: ScrollBehavior) {
+    const container = classTabsRef.current;
+    const page = classTabPages[pageIndex];
+
+    if (!container || !page) {
+      return;
+    }
+
+    container.scrollTo({ left: page.scrollLeft, behavior });
+    setVisibleClassPageIndex((current) => (current === pageIndex ? current : pageIndex));
+  }
+
+  useEffect(() => {
+    window.addEventListener("resize", measureClassTabPages);
+    return () => window.removeEventListener("resize", measureClassTabPages);
+  }, [measureClassTabPages]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(measureClassTabPages);
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeCount, classNo, classNumbersState, classStudentCountsState, measureClassTabPages]);
+
+  useEffect(() => {
+    const classIndex = Math.max(0, classNumbersState.findIndex((itemClassNo) => itemClassNo === classNo));
+    const targetPageIndex = pageIndexForItemIndex(classTabPages, classIndex);
+    const frame = window.requestAnimationFrame(() => {
+      const container = classTabsRef.current;
+      const targetPage = classTabPages[targetPageIndex];
+
+      if (!container || !targetPage) {
+        return;
+      }
+
+      container.scrollTo({ left: targetPage.scrollLeft, behavior: "auto" });
+      setVisibleClassPageIndex((current) => (current === targetPageIndex ? current : targetPageIndex));
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [classNo, classNumbersState, classTabPages]);
 
   useEffect(() => {
     if (!groupCountPickerOpen) {
@@ -295,6 +402,14 @@ export function StudentSpreadsheet({
     }
 
     return "학생 명단 저장 중 오류가 발생했습니다.";
+  }
+
+  function actionErrorMessage(error: unknown, fallback: string) {
+    if (error instanceof Error && error.message) {
+      return error.message;
+    }
+
+    return fallback;
   }
 
   function clearActionFeedbackTimer(key: string) {
@@ -541,46 +656,30 @@ export function StudentSpreadsheet({
     }
   }
 
-  async function copyGroupPasswords() {
-    try {
-      await runActionWithFeedback("copy-group-passwords", async () => {
-        const text = groupsState
-          .map((group) => {
-            const password = visiblePassword(group.password_hash) || "(없음)";
-            return `${groupDisplayName(classNo, group)} 그룹 비밀번호: ${password}`;
-          })
-          .join("\n");
-
-        if (navigator.clipboard?.writeText) {
-          await navigator.clipboard.writeText(text);
-          return;
-        }
-
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.left = "-9999px";
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand("copy");
-        document.body.removeChild(textarea);
-      });
-    } catch (error) {
-      console.error(error);
-    }
-  }
-
   function showGroupCountWarning(message: string) {
     if (warningTimerRef.current !== null) {
       window.clearTimeout(warningTimerRef.current);
     }
 
+    setClassCountWarning("");
     setGroupCountWarning(message);
     warningTimerRef.current = window.setTimeout(() => {
       setGroupCountWarning("");
       warningTimerRef.current = null;
     }, 2200);
+  }
+
+  function showClassCountWarning(message: string) {
+    if (warningTimerRef.current !== null) {
+      window.clearTimeout(warningTimerRef.current);
+    }
+
+    setGroupCountWarning("");
+    setClassCountWarning(message);
+    warningTimerRef.current = window.setTimeout(() => {
+      setClassCountWarning("");
+      warningTimerRef.current = null;
+    }, 2600);
   }
 
   function beginDeleteRow(rowKey: string) {
@@ -605,6 +704,67 @@ export function StudentSpreadsheet({
       delete rowDeleteTimersRef.current[rowKey];
       deleteRowByKey(rowKey);
     }, 900);
+  }
+
+  async function handleClassCountSubmit() {
+    const parsedValue = Number.parseInt(classCountInput.trim(), 10);
+
+    if (!Number.isInteger(parsedValue) || String(parsedValue) !== classCountInput.trim()) {
+      showClassCountWarning("학급 수는 숫자로 입력해야 합니다.");
+      return;
+    }
+
+    if (parsedValue < 1) {
+      showClassCountWarning("학급 수는 1 이상이어야 합니다.");
+      return;
+    }
+
+    if (parsedValue === classNumbersState.length) {
+      return;
+    }
+
+    const confirmed = await confirm({
+      title: `학급 수를 ${parsedValue}개로 변경할까요?`,
+      confirmLabel: "변경",
+    });
+
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await flushPendingSave();
+      const formData = new FormData();
+      formData.set("classCount", String(parsedValue));
+      formData.set("returnClassNo", String(classNo));
+      const result = await runActionWithFeedback("class-count", () => classCountAction(formData));
+
+      if (!result?.classNumbers || !result.classCount) {
+        return;
+      }
+
+      setClassNumbersState(result.classNumbers);
+      setClassStudentCountsState((current) => {
+        const next: Record<number, number> = {};
+
+        for (const itemClassNo of result.classNumbers ?? []) {
+          next[itemClassNo] = current[itemClassNo] ?? 0;
+        }
+
+        return next;
+      });
+      setClassCountInput(String(result.classCount));
+
+      if (classNo > result.classCount) {
+        router.replace(`/admin?classNo=${result.currentClassNo ?? result.classCount}`);
+        return;
+      }
+
+      showSaveNotice("");
+    } catch (error) {
+      console.error(error);
+      showClassCountWarning(actionErrorMessage(error, "학급 수를 변경하지 못했습니다."));
+    }
   }
 
   async function handleGroupCountSelect(targetCount: number) {
@@ -641,7 +801,7 @@ export function StudentSpreadsheet({
       }
     } catch (error) {
       console.error(error);
-      showGroupCountWarning("그룹 개수를 변경하지 못했습니다.");
+      showGroupCountWarning("그룹 수를 변경하지 못했습니다.");
     }
   }
 
@@ -663,42 +823,90 @@ export function StudentSpreadsheet({
     }
   }
 
-  async function handleCompactGroupNames() {
-    try {
-      await flushPendingSave();
-      const formData = new FormData();
-      formData.set("classNo", String(classNo));
-      formData.set("returnClassNo", String(classNo));
-      const result = await runActionWithFeedback("compact-group-names", () =>
-        compactGroupNamesAction(formData),
-      );
+  async function handleGroupPasswordSubmit(form: HTMLFormElement, groupId: string, clearPassword = false) {
+    const formData = new FormData(form);
+    const password = String(formData.get(`password-${groupId}`) ?? "").trim();
+    formData.set("clearPassword", clearPassword ? "1" : "0");
 
-      if (result?.groups) {
-        applyGroupsUpdate(result.groups);
+    if (!clearPassword && !password) {
+      showSaveNotice("새 그룹 비밀번호를 입력하세요.");
+      return;
+    }
+
+    try {
+      const result = await runActionWithFeedback(`group-password-${groupId}`, () => passwordAction(formData));
+      if (result?.group) {
+        setGroupsState((current) =>
+          current.map((group) =>
+            group.id === groupId ? result.group! : group,
+          ),
+        );
+      } else if (clearPassword) {
+        setGroupsState((current) =>
+          current.map((group) =>
+            group.id === groupId ? { ...group, password_hash: null, has_password: false } : group,
+          ),
+        );
       }
+      form.reset();
     } catch (error) {
       console.error(error);
     }
   }
 
-  async function handleGroupPasswordSubmit(form: HTMLFormElement, groupId: string) {
+  async function handleBulkPasswordSubmit(form: HTMLFormElement, clearPassword = false) {
     const formData = new FormData(form);
-    const password = String(formData.get(`password-${groupId}`) ?? "").trim();
+    const password = String(formData.get("password") ?? "").trim();
+    formData.set("clearPassword", clearPassword ? "1" : "0");
+
+    if (!groupsState.length) {
+      showSaveNotice("먼저 그룹을 만들어야 합니다.");
+      return;
+    }
+
+    if (!clearPassword && !password) {
+      showSaveNotice("반 전체에 적용할 비밀번호를 입력하세요.");
+      return;
+    }
+
+    if (clearPassword) {
+      const confirmed = await confirm({
+        title: `${classNo}반 모든 그룹의 비밀번호를 해제할까요?`,
+        confirmLabel: "해제",
+        tone: "danger",
+      });
+
+      if (!confirmed) {
+        return;
+      }
+    }
 
     try {
-      await runActionWithFeedback(`group-password-${groupId}`, () => passwordAction(formData));
-      setGroupsState((current) =>
-        current.map((group) =>
-          group.id === groupId ? { ...group, password_hash: password || null } : group,
-        ),
-      );
+      const feedbackKey = clearPassword ? "bulk-class-password-clear" : "bulk-class-password";
+      const result = await runActionWithFeedback(feedbackKey, () => bulkPasswordAction(formData));
+      if (result?.groups) {
+        applyGroupsUpdate(result.groups);
+      }
+      form.reset();
+      setBulkPasswordVisible(false);
     } catch (error) {
       console.error(error);
+      showSaveNotice(
+        actionErrorMessage(
+          error,
+          clearPassword ? "반 전체 비밀번호를 해제하지 못했습니다." : "반 전체 비밀번호를 설정하지 못했습니다.",
+        ),
+      );
     }
   }
 
   async function clearAllGroupAssignments() {
-    if (!window.confirm(`${classNo}반 전체 학생을 미지정 그룹으로 변경할까요?`)) {
+    const confirmed = await confirm({
+      title: `${classNo}반 전체 학생을 미지정으로 변경할까요?`,
+      confirmLabel: "변경",
+    });
+
+    if (!confirmed) {
       return;
     }
 
@@ -725,46 +933,125 @@ export function StudentSpreadsheet({
     }
   }
 
-  const activeCount = activeRows.length;
+  async function handleDeleteClassStudents() {
+    const confirmed = await confirm({
+      title: `${classNo}반 전체 학생을 정말로 삭제할까요?`,
+      confirmLabel: "삭제",
+      tone: "danger",
+    });
+
+    if (!confirmed) {
+      return;
+    }
+
+    deleteStudentsFormRef.current?.requestSubmit();
+  }
 
   return (
-    <div className="grid gap-5">
-      <nav className="grid grid-cols-7 overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-sm">
-        {CLASS_NUMBERS.map((itemClassNo) => {
-          const active = itemClassNo === classNo;
-          const count = active ? activeCount : classStudentCounts[itemClassNo];
+    <div className="grid min-w-0 gap-5">
+      <section className="min-w-0 rounded-lg border border-zinc-200 bg-white p-4 shadow-sm">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-bold">학급</h2>
+            <p className="mt-1 text-sm text-zinc-500">현재 {classNumbersState.length}개 반</p>
+          </div>
+          <div className="relative flex flex-wrap items-center gap-2">
+            <label className="text-sm font-semibold text-zinc-700" htmlFor="classCount">
+              학급 수
+            </label>
+            <input
+              id="classCount"
+              type="number"
+              min="1"
+              inputMode="numeric"
+              value={classCountInput}
+              disabled={actionFeedback["class-count"] === "pending"}
+              onChange={(event) => setClassCountInput(event.target.value)}
+              className="min-h-10 w-24 rounded-md border border-zinc-300 bg-white px-3 text-sm font-semibold text-zinc-800 outline-none focus:border-teal-500 disabled:cursor-not-allowed disabled:opacity-50"
+            />
+            <ActionStatusButton
+              disabled={actionFeedback["class-count"] === "pending"}
+              onClick={() => void handleClassCountSubmit()}
+              label="저장"
+              display={actionLabel("class-count", "저장")}
+            />
+            {classCountWarning ? (
+              <p className="absolute right-0 top-full z-20 mt-2 w-72 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900 shadow-sm">
+                {classCountWarning}
+              </p>
+            ) : null}
+          </div>
+        </div>
 
-          return (
-            <Link
-              key={itemClassNo}
-              href={`/admin?classNo=${itemClassNo}`}
-              className={`min-h-12 border-r border-zinc-200 px-2 py-2 text-center text-sm font-semibold last:border-r-0 ${
-                active ? "bg-zinc-900 text-white" : "bg-white text-zinc-700 hover:bg-zinc-50"
-              }`}
-            >
-              <span className="block">{itemClassNo}반</span>
-              <span className={`text-xs ${active ? "text-zinc-300" : "text-zinc-400"}`}>
-                {count}명
-              </span>
-            </Link>
-          );
-        })}
-      </nav>
+        <nav
+          ref={classTabsRef}
+          onScroll={() => syncVisibleClassPageFromScroll()}
+          {...classTabDragHandlers}
+          className={`mt-4 flex w-full min-w-0 max-w-full overflow-x-auto overscroll-contain rounded-lg border border-zinc-200 bg-white ${
+            classTabsDragging ? "cursor-grabbing select-none" : "cursor-grab"
+          }`}
+        >
+          {classNumbersState.map((itemClassNo) => {
+            const active = itemClassNo === classNo;
+            const count = active ? activeCount : classStudentCountsState[itemClassNo] ?? 0;
+
+            return (
+              <Link
+                key={itemClassNo}
+                data-class-no={itemClassNo}
+                href={`/admin?classNo=${itemClassNo}`}
+                className={`min-h-12 min-w-16 shrink-0 border-r border-zinc-200 px-3 py-2 text-center text-sm font-semibold last:border-r-0 sm:min-w-20 ${
+                  active ? "bg-zinc-900 text-white" : "bg-white text-zinc-700 hover:bg-zinc-50"
+                }`}
+              >
+                <span className="block">{itemClassNo}반</span>
+                <span className={`text-xs ${active ? "text-zinc-300" : "text-zinc-400"}`}>
+                  {count}명
+                </span>
+              </Link>
+            );
+          })}
+        </nav>
+
+        {classTabPages.length > 1 ? (
+          <div className="mt-3 flex justify-center">
+            <div className="flex max-w-full gap-2 overflow-x-auto px-1 py-1">
+              {classTabPages.map((page, index) => {
+                const firstClass = classNumbersState[page.startIndex] ?? 1;
+                const lastClass = classNumbersState[Math.max(page.endIndex - 1, page.startIndex)] ?? firstClass;
+                const active = index === visibleClassPageIndex;
+
+                return (
+                  <button
+                    key={index}
+                    type="button"
+                    title={`${firstClass}반 ~ ${lastClass}반`}
+                    aria-label={`${firstClass}반부터 ${lastClass}반까지 보기`}
+                    onClick={() => scrollClassTabsToPage(index, "smooth")}
+                    className={`h-2.5 w-2.5 shrink-0 rounded-full transition ${
+                      active ? "bg-zinc-900" : "bg-zinc-300 hover:bg-zinc-500"
+                    }`}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+      </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h2 className="text-xl font-bold">그룹</h2>
-            <p className="mt-1 text-sm text-zinc-500">{activeCount}명</p>
+            <h2 className="text-xl font-bold">{classNo}반 그룹</h2>
           </div>
           <div className="relative flex flex-wrap items-center gap-2">
-            <label className="text-sm font-semibold text-zinc-700" htmlFor="groupCount">
-              그룹 개수
+            <label className="text-base font-medium text-zinc-700" htmlFor="groupCount">
+              그룹 수
             </label>
             {groupCountPickerOpen ? (
               <button
                 type="button"
-                aria-label="그룹 개수 선택 닫기"
+                aria-label="그룹 수 선택 닫기"
                 className="fixed inset-0 z-20 cursor-default bg-transparent"
                 onClick={() => setGroupCountPickerOpen(false)}
               />
@@ -793,7 +1080,7 @@ export function StudentSpreadsheet({
                 onClick={(event) => event.stopPropagation()}
               >
                 <div className="col-span-full flex items-center justify-between rounded-md bg-zinc-50 px-2.5 py-2">
-                  <span className="text-sm font-semibold text-zinc-800">그룹 개수 선택</span>
+                  <span className="text-sm font-semibold text-zinc-800">그룹 수 선택</span>
                   <span className="text-xs font-medium text-zinc-500">현재 {groupsState.length}개</span>
                 </div>
                 {Array.from({ length: 27 }, (_, count) => {
@@ -818,33 +1105,11 @@ export function StudentSpreadsheet({
               type="button"
               disabled={actionFeedback["delete-empty-groups"] === "pending"}
               onClick={() => void handleDeleteEmptyGroups()}
-              className="rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <StableButtonLabel
                 label="빈 그룹 삭제"
                 display={actionLabel("delete-empty-groups", "빈 그룹 삭제")}
-              />
-            </button>
-            <button
-              type="button"
-              disabled={actionFeedback["compact-group-names"] === "pending"}
-              onClick={() => void handleCompactGroupNames()}
-              className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <StableButtonLabel
-                label="그룹명 재정렬"
-                display={actionLabel("compact-group-names", "그룹명 재정렬")}
-              />
-            </button>
-            <button
-              type="button"
-              disabled={actionFeedback["copy-group-passwords"] === "pending"}
-              onClick={() => void copyGroupPasswords()}
-              className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <StableButtonLabel
-                label="그룹비밀번호 복사"
-                display={actionLabel("copy-group-passwords", "그룹비밀번호 복사")}
               />
             </button>
             {groupCountWarning ? (
@@ -855,9 +1120,71 @@ export function StudentSpreadsheet({
           </div>
         </div>
 
+        <form
+          className="mt-4 grid gap-2 rounded-lg border border-zinc-200 bg-zinc-50 p-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleBulkPasswordSubmit(event.currentTarget);
+          }}
+        >
+          <input type="hidden" name="classNo" value={classNo} />
+          <input type="hidden" name="returnClassNo" value={classNo} />
+          <p className="text-lg font-semibold text-zinc-800">전체 그룹 비밀번호</p>
+          <div className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto] gap-2">
+            <div className="flex min-w-0 items-stretch rounded-md border border-zinc-300 bg-white focus-within:border-teal-500">
+              <input
+                name="password"
+                type={bulkPasswordVisible ? "text" : "password"}
+                autoComplete="new-password"
+                data-1p-ignore="true"
+                data-lpignore="true"
+                placeholder="일괄 비밀번호"
+                className="min-h-10 min-w-0 flex-1 bg-transparent px-3 text-sm outline-none"
+              />
+              <button
+                type="button"
+                title={bulkPasswordVisible ? "비밀번호 숨기기" : "비밀번호 보기"}
+                aria-label={bulkPasswordVisible ? "비밀번호 숨기기" : "비밀번호 보기"}
+                onClick={() => setBulkPasswordVisible((current) => !current)}
+                className="flex min-h-10 w-10 shrink-0 items-center justify-center text-zinc-700"
+              >
+                {bulkPasswordVisible ? <EyeIcon /> : <EyeOffIcon />}
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={actionFeedback["bulk-class-password-clear"] === "pending" || !groupsState.length}
+                onClick={(event) => {
+                  const form = event.currentTarget.form;
+
+                  if (form) {
+                    void handleBulkPasswordSubmit(form, true);
+                  }
+                }}
+                className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <StableButtonLabel
+                  label="해제"
+                  display={actionLabel("bulk-class-password-clear", "해제")}
+                />
+              </button>
+              <button
+                disabled={actionFeedback["bulk-class-password"] === "pending" || !groupsState.length}
+                className="rounded-md bg-zinc-900 px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <StableButtonLabel
+                  label="설정"
+                  display={actionLabel("bulk-class-password", "설정")}
+                />
+              </button>
+            </div>
+          </div>
+        </form>
+
         <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           <GroupDropZone
-            title="미지정 그룹"
+            title="미지정"
             count={activeRows.filter((row) => !row.groupId).length}
             onDrop={(event) => handleDrop(event, "")}
           >
@@ -888,6 +1215,7 @@ export function StudentSpreadsheet({
             const groupRows = rows
               .map((row, rowIndex) => ({ row, rowIndex }))
               .filter(({ row }) => row.name.trim() && !row.deleted && row.groupId === group.id);
+            const hasPassword = groupHasPassword(group);
 
             return (
               <GroupDropZone
@@ -916,7 +1244,7 @@ export function StudentSpreadsheet({
                   )}
                 </div>
                 <form
-                  className="mt-3 grid grid-cols-[minmax(0,1fr)_auto] gap-2"
+                  className="mt-3 grid gap-2"
                   onSubmit={(event) => {
                     event.preventDefault();
                     void handleGroupPasswordSubmit(event.currentTarget, group.id);
@@ -924,6 +1252,10 @@ export function StudentSpreadsheet({
                 >
                   <input type="hidden" name="groupId" value={group.id} />
                   <input type="hidden" name="returnClassNo" value={classNo} />
+                  <p className="text-xs font-medium text-zinc-500">
+                    {hasPassword ? "비밀번호 설정됨" : "비밀번호 없음"}
+                  </p>
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
                   <div className="flex min-w-0 items-stretch rounded-md border border-zinc-300 bg-white focus-within:border-teal-500">
                     <input
                       name={`password-${group.id}`}
@@ -931,8 +1263,8 @@ export function StudentSpreadsheet({
                       autoComplete="new-password"
                       data-1p-ignore="true"
                       data-lpignore="true"
-                      defaultValue={visiblePassword(group.password_hash)}
-                      placeholder={`${groupDisplayName(classNo, group)} 비밀번호`}
+                      defaultValue=""
+                      placeholder={hasPassword ? `${groupDisplayName(classNo, group)} 새 비밀번호` : `${groupDisplayName(classNo, group)} 비밀번호 설정`}
                       className="min-h-10 min-w-0 flex-1 bg-transparent px-3 text-sm outline-none"
                     />
                     <button
@@ -955,15 +1287,33 @@ export function StudentSpreadsheet({
                       {visiblePasswordGroups.has(group.id) ? <EyeIcon /> : <EyeOffIcon />}
                     </button>
                   </div>
-                  <button
-                    disabled={actionFeedback[`group-password-${group.id}`] === "pending"}
-                    className="rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <StableButtonLabel
-                      label="설정"
-                      display={actionLabel(`group-password-${group.id}`, "설정")}
-                    />
-                  </button>
+                    <div className="flex items-center gap-2">
+                      {hasPassword ? (
+                        <button
+                          type="button"
+                          disabled={actionFeedback[`group-password-${group.id}`] === "pending"}
+                          onClick={(event) => {
+                            const form = event.currentTarget.form;
+                            if (form) {
+                              void handleGroupPasswordSubmit(form, group.id, true);
+                            }
+                          }}
+                          className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          해제
+                        </button>
+                      ) : null}
+                      <button
+                        disabled={actionFeedback[`group-password-${group.id}`] === "pending"}
+                        className="rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <StableButtonLabel
+                          label="설정"
+                          display={actionLabel(`group-password-${group.id}`, "설정")}
+                        />
+                      </button>
+                    </div>
+                  </div>
                 </form>
               </GroupDropZone>
             );
@@ -983,17 +1333,17 @@ export function StudentSpreadsheet({
               전체 미지정
             </button>
             <form
+              ref={deleteStudentsFormRef}
               action={deleteClassStudentsAction}
-              onSubmit={(event) => {
-                if (!window.confirm(`${classNo}반 전체 학생을 정말로 삭제할까요?`)) {
-                  event.preventDefault();
-                }
-              }}
               suppressHydrationWarning
             >
               <input type="hidden" name="classNo" value={classNo} />
               <input type="hidden" name="returnClassNo" value={classNo} />
-              <button className="rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-semibold text-red-700">
+              <button
+                type="button"
+                onClick={() => void handleDeleteClassStudents()}
+                className="rounded-md border border-red-200 bg-white px-3 py-2 text-sm font-semibold text-red-700"
+              >
                 전체 삭제
               </button>
             </form>
@@ -1135,6 +1485,7 @@ export function StudentSpreadsheet({
           </div>
         </form>
       </section>
+      {confirmDialog}
     </div>
   );
 }

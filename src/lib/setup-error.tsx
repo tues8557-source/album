@@ -1,10 +1,28 @@
 export function isMissingSchemaError(error: unknown) {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "42703"
-  );
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const candidate = error as {
+    code?: string;
+    message?: string;
+    details?: string;
+    hint?: string;
+  };
+  const code = candidate.code ?? "";
+  const combined = `${candidate.message ?? ""} ${candidate.details ?? ""} ${candidate.hint ?? ""}`.toLowerCase();
+  const mentionsSchemaSetup =
+    /app_settings|homes|active_home_id|home_id|class_count|class_no|class_id|groups_class_no_check|students_class_no_check/.test(combined);
+
+  if (code === "42703" || code === "42P01" || code === "42P10") {
+    return true;
+  }
+
+  if ((code === "23514" || code === "23505" || code === "PGRST116") && mentionsSchemaSetup) {
+    return true;
+  }
+
+  return false;
 }
 
 export function SetupError() {
@@ -16,7 +34,9 @@ export function SetupError() {
         <p className="mt-3 text-sm leading-6 text-zinc-600">
           Supabase SQL Editor에서 <code className="font-mono">supabase/schema.sql</code>을 실행한 뒤
           페이지를 새로고침하세요. 기존 테이블에 <code className="font-mono">class_id</code>가 있는 경우
-          SQL이 <code className="font-mono">class_no</code> 컬럼을 추가하고 값을 복사합니다.
+          SQL이 <code className="font-mono">class_no</code> 컬럼을 추가하고 값을 복사하며,
+          최근 버전은 <code className="font-mono">app_settings</code>, <code className="font-mono">homes</code>,
+          <code className="font-mono">home_id</code> 관련 컬럼도 함께 필요합니다.
         </p>
       </section>
     </main>

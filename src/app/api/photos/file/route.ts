@@ -1,33 +1,9 @@
-import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
-import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
+import { getGroupAccessState } from "@/lib/auth";
 import { createServiceSupabase } from "@/lib/supabase/server";
 
 function errorResponse(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status });
-}
-
-async function canAccessGroup(classNo: number, groupId: string, access: string) {
-  const supabase = createServiceSupabase();
-  const { data: group, error } = await supabase
-    .from("groups")
-    .select("*")
-    .eq("id", groupId)
-    .eq("class_no", classNo)
-    .is("deleted_at", null)
-    .single();
-
-  if (error || !group) {
-    return { allowed: false, publicCache: false };
-  }
-
-  const store = await cookies();
-  const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  const groupSession = hasValidGroupAccessToken(access, groupId, group.access_nonce);
-  return {
-    allowed: admin || !group.password_hash || groupSession,
-    publicCache: !group.password_hash || groupSession,
-  };
 }
 
 function transformForVariant(variant: string) {
@@ -66,14 +42,13 @@ export async function GET(request: Request) {
   const classNo = Number.parseInt(String(searchParams.get("classNo") ?? ""), 10);
   const groupId = String(searchParams.get("groupId") ?? "").trim();
   const photoId = String(searchParams.get("photoId") ?? "").trim();
-  const access = String(searchParams.get("access") ?? "").trim();
   const variant = String(searchParams.get("variant") ?? "full").trim();
 
   if (!classNo || !groupId || !photoId || !["gallery", "viewer", "editor", "full"].includes(variant)) {
     return errorResponse("이미지 요청 정보를 확인할 수 없습니다.");
   }
 
-  const accessState = await canAccessGroup(classNo, groupId, access);
+  const accessState = await getGroupAccessState(classNo, groupId);
   if (!accessState.allowed) {
     return errorResponse("권한을 확인할 수 없습니다.", 403);
   }
@@ -103,7 +78,7 @@ export async function GET(request: Request) {
     headers: {
       "Cache-Control": accessState.publicCache
         ? "public, max-age=31536000, immutable"
-        : "private, max-age=31536000, immutable",
+        : "private, no-store",
       "Content-Length": String(data.size),
       "Content-Type": data.type || photo.mime_type || "application/octet-stream",
       ETag: `"${photo.id}-${variant}"`,

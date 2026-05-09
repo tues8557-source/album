@@ -351,14 +351,12 @@ function imageRouteForPhoto(
   classNo: number,
   groupId: string,
   photoId: string,
-  access: string,
   variant: PhotoAssetVariant,
 ) {
   return photoAssetUrl({
     classNo,
     groupId,
     photoId,
-    access,
     variant,
   });
 }
@@ -551,12 +549,10 @@ function isMobileViewerArrowMode() {
 export function PhotoGallery({
   classNo,
   groupId,
-  access,
   photos,
 }: {
   classNo: number;
   groupId: string;
-  access: string;
   photos: Photo[];
 }) {
   const router = useRouter();
@@ -624,7 +620,6 @@ export function PhotoGallery({
     const params = new URLSearchParams({
       classNo: String(classNo),
       groupId,
-      access,
     });
 
     const response = await fetch(`/api/photos/sync?${params.toString()}`, {
@@ -648,7 +643,7 @@ export function PhotoGallery({
     }
 
     syncDisplayPhotos(body.photos.map((photo) => normalizePhotoPayload(photo)));
-  }, [access, classNo, groupId, syncDisplayPhotos]);
+  }, [classNo, groupId, syncDisplayPhotos]);
 
   useEffect(() => {
     syncDisplayPhotos(photos.map((photo) => normalizePhotoPayload(photo)));
@@ -884,7 +879,6 @@ export function PhotoGallery({
         body: JSON.stringify({
           classNo,
           groupId,
-          access,
           photoId,
           favorite,
         }),
@@ -955,7 +949,7 @@ export function PhotoGallery({
       }
 
       void prefetchViewerImage(
-        imageRouteForPhoto(classNo, groupId, targetPhoto.id, access, "viewer"),
+        imageRouteForPhoto(classNo, groupId, targetPhoto.id, "viewer"),
       ).catch(() => null);
     }
 
@@ -976,7 +970,6 @@ export function PhotoGallery({
       >
         <input type="hidden" name="classNo" value={classNo} />
         <input type="hidden" name="groupId" value={groupId} />
-        <input type="hidden" name="access" value={access} />
         {[...selectedPhotoIds].map((photoId) => (
           <input key={photoId} type="hidden" name="photoId" value={photoId} />
         ))}
@@ -1019,7 +1012,7 @@ export function PhotoGallery({
                   }`}
                 >
                   <img
-                    src={photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "gallery")}
+                    src={photo.url || imageRouteForPhoto(classNo, groupId, photo.id, "gallery")}
                     alt={photo.original_name ?? "group photo"}
                     loading="lazy"
                     decoding="async"
@@ -1134,7 +1127,6 @@ export function PhotoGallery({
         <PhotoViewer
           classNo={classNo}
           groupId={groupId}
-          access={access}
           photos={displayPhotos}
           onPhotoEdited={handlePhotoEdited}
           onPhotoDeleted={handlePhotoDeleted}
@@ -1159,7 +1151,6 @@ export function PhotoGallery({
 function PhotoViewer({
   classNo,
   groupId,
-  access,
   photos,
   onPhotoEdited,
   onPhotoDeleted,
@@ -1171,7 +1162,6 @@ function PhotoViewer({
 }: {
   classNo: number;
   groupId: string;
-  access: string;
   photos: PhotoWithUrl[];
   onPhotoEdited: (previousPhotoId: string, editedPhoto: Photo, blob: Blob) => void;
   onPhotoDeleted: (photoId: string) => void;
@@ -1185,9 +1175,9 @@ function PhotoViewer({
   const currentLabel = `${index + 1} / ${photos.length}`;
   const displayName = photo.original_name ?? "사진";
   const displaySize = formatFileSize(photo.size);
-  const viewerPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "viewer");
-  const fullPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "full");
-  const editorPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "editor");
+  const viewerPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, "viewer");
+  const fullPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, "full");
+  const editorPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, "editor");
 
   const imageRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -1463,10 +1453,10 @@ function PhotoViewer({
       }
 
       void prefetchViewerImage(
-        imageRouteForPhoto(classNo, groupId, targetPhoto.id, access, "viewer"),
+        imageRouteForPhoto(classNo, groupId, targetPhoto.id, "viewer"),
       ).catch(() => null);
     }
-  }, [access, classNo, groupId, index, photo.id, photos]);
+  }, [classNo, groupId, index, photo.id, photos]);
 
   const normalizedRotation = ((rotation % 360) + 360) % 360;
   const rotatedImageSize = useMemo(() => {
@@ -1898,7 +1888,6 @@ function PhotoViewer({
     const formData = new FormData();
     formData.append("classNo", String(classNo));
     formData.append("groupId", groupId);
-    formData.append("access", access);
     formData.append("photoId", photo.id);
     formData.append("photo", new File([blob], photo.original_name ?? `photo-${index + 1}`, { type: blob.type }));
 
@@ -2147,7 +2136,6 @@ function PhotoViewer({
         body: JSON.stringify({
           classNo,
           groupId,
-          access,
           photoId: photo.id,
         }),
       });

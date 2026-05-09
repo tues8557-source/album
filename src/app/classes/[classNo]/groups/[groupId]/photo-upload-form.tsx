@@ -46,12 +46,10 @@ async function readErrorMessage(response: Response, fallback: string) {
 async function prepareUpload({
   classNo,
   groupId,
-  access,
   file,
 }: {
   classNo: number;
   groupId: string;
-  access: string;
   file: File;
 }) {
   const response = await fetch("/api/photos/upload-url", {
@@ -60,7 +58,6 @@ async function prepareUpload({
     body: JSON.stringify({
       classNo,
       groupId,
-      access,
       fileName: file.name,
       mimeType: file.type,
       size: file.size,
@@ -77,13 +74,11 @@ async function prepareUpload({
 async function recordUpload({
   classNo,
   groupId,
-  access,
   file,
   storagePath,
 }: {
   classNo: number;
   groupId: string;
-  access: string;
   file: File;
   storagePath: string;
 }) {
@@ -93,7 +88,6 @@ async function recordUpload({
     body: JSON.stringify({
       classNo,
       groupId,
-      access,
       photo: {
         storagePath,
         originalName: file.name,
@@ -158,11 +152,9 @@ function uploadFileToSignedUrl({
 export function PhotoUploadForm({
   classNo,
   groupId,
-  access,
 }: {
   classNo: number;
   groupId: string;
-  access: string;
 }) {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -225,7 +217,6 @@ export function PhotoUploadForm({
         const { signedUrl, storagePath } = await prepareUpload({
           classNo,
           groupId,
-          access,
           file,
         });
         await uploadFileToSignedUrl({
@@ -238,7 +229,6 @@ export function PhotoUploadForm({
         await recordUpload({
           classNo,
           groupId,
-          access,
           file,
           storagePath,
         });

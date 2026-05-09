@@ -1,8 +1,7 @@
 import { randomUUID } from "crypto";
-import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
+import { getGroupAccessState } from "@/lib/auth";
 import { safeFileName } from "@/lib/format";
-import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
 import { createServiceSupabase } from "@/lib/supabase/server";
 
 const ALLOWED_EXTENSIONS = /\.(jpe?g|png|gif|webp|heic|heif)$/i;
@@ -15,36 +14,15 @@ function isImageFile(fileName: string, mimeType: string) {
   return mimeType.startsWith("image/") || ALLOWED_EXTENSIONS.test(fileName);
 }
 
-async function canAccessGroup(classNo: number, groupId: string, access: string) {
-  const supabase = createServiceSupabase();
-  const { data: group, error } = await supabase
-    .from("groups")
-    .select("*")
-    .eq("id", groupId)
-    .eq("class_no", classNo)
-    .is("deleted_at", null)
-    .single();
-
-  if (error || !group) {
-    return false;
-  }
-
-  const store = await cookies();
-  const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  const groupSession = hasValidGroupAccessToken(access, groupId, group.access_nonce);
-  return admin || !group.password_hash || groupSession;
-}
-
 export async function POST(request: Request) {
   try {
     const body = await request.json();
     const classNo = Number.parseInt(String(body.classNo ?? ""), 10);
     const groupId = String(body.groupId ?? "").trim();
-    const access = String(body.access ?? "").trim();
     const fileName = String(body.fileName ?? "").trim();
     const mimeType = String(body.mimeType ?? "").trim();
 
-    if (!classNo || !groupId || !(await canAccessGroup(classNo, groupId, access))) {
+    if (!classNo || !groupId || !(await getGroupAccessState(classNo, groupId)).allowed) {
       return jsonError("그룹 접근 권한을 확인할 수 없습니다.", 403);
     }
 

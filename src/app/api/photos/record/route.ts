@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
 import { revalidatePath, revalidateTag } from "next/cache";
+import { getGroupAccessState } from "@/lib/auth";
 import { activePhotosTag } from "@/lib/photo-assets";
-import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
 import { createServiceSupabase } from "@/lib/supabase/server";
 
 type UploadedPhoto = {
@@ -16,35 +15,14 @@ function jsonError(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status });
 }
 
-async function canAccessGroup(classNo: number, groupId: string, access: string) {
-  const supabase = createServiceSupabase();
-  const { data: group, error } = await supabase
-    .from("groups")
-    .select("*")
-    .eq("id", groupId)
-    .eq("class_no", classNo)
-    .is("deleted_at", null)
-    .single();
-
-  if (error || !group) {
-    return false;
-  }
-
-  const store = await cookies();
-  const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  const groupSession = hasValidGroupAccessToken(access, groupId, group.access_nonce);
-  return admin || !group.password_hash || groupSession;
-}
-
 export async function POST(request: Request) {
   try {
     const body = await request.json();
     const classNo = Number.parseInt(String(body.classNo ?? ""), 10);
     const groupId = String(body.groupId ?? "").trim();
-    const access = String(body.access ?? "").trim();
     const photo = body.photo as Partial<UploadedPhoto> | undefined;
 
-    if (!classNo || !groupId || !(await canAccessGroup(classNo, groupId, access))) {
+    if (!classNo || !groupId || !(await getGroupAccessState(classNo, groupId)).allowed) {
       return jsonError("그룹 접근 권한을 확인할 수 없습니다.", 403);
     }
 
