@@ -8,6 +8,7 @@ import { activePhotosTag, deletedPhotosTag } from "@/lib/photo-assets";
 import { createServiceSupabase } from "@/lib/supabase/server";
 import { compactClassGroupSortOrders, normalizeClassGroupSortOrders } from "@/lib/data";
 import { groupName, isClassNumber, safeFileName } from "@/lib/format";
+import type { Group } from "@/lib/types";
 import {
   createSignedToken,
   isAdminPassword,
@@ -27,6 +28,34 @@ function text(formData: FormData, key: string) {
 
 function numberValue(formData: FormData, key: string) {
   return Number.parseInt(text(formData, key), 10);
+}
+
+function nullableGender(value: string) {
+  if (value === "female") {
+    return "female";
+  }
+
+  if (value === "male") {
+    return "male";
+  }
+
+  return null;
+}
+
+function isStudentGenderConstraintError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const candidate = error as {
+    code?: string;
+    message?: string;
+    details?: string;
+    hint?: string;
+  };
+  const combined = `${candidate.message ?? ""} ${candidate.details ?? ""} ${candidate.hint ?? ""}`;
+
+  return (candidate.code === "23502" || candidate.code === "23514") && /gender/i.test(combined);
 }
 
 function adminPath(classNo?: number) {
@@ -52,6 +81,23 @@ async function requireAdmin() {
   if (!(await hasAdminSession())) {
     redirect("/admin");
   }
+}
+
+async function activeGroupsForClass(classNo: number) {
+  const { data, error } = await createServiceSupabase()
+    .from("groups")
+    .select("*")
+    .eq("class_no", classNo)
+    .is("deleted_at", null)
+    .order("sort_order", { ascending: true })
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true });
+
+  if (error) {
+    throw error;
+  }
+
+  return (data ?? []) as Group[];
 }
 
 async function requireGroupAccess(groupId: string, classNo: number, accessToken: string) {
@@ -126,9 +172,9 @@ export async function createStudent(formData: FormData) {
   await requireAdmin();
   const classNo = numberValue(formData, "classNo");
   const name = text(formData, "name");
-  const gender = text(formData, "gender");
+  const gender = nullableGender(text(formData, "gender"));
 
-  if (!isClassNumber(classNo) || !name || !["male", "female"].includes(gender)) {
+  if (!isClassNumber(classNo) || !name) {
     redirect(adminErrorPath("bad-student", returnClassNo(formData)));
   }
 
@@ -169,7 +215,7 @@ export async function createStudents(formData: FormData) {
   const rows = names
     .map((name, index) => ({
       name,
-      gender: genders[index] === "female" ? "female" : "male",
+      gender: nullableGender(genders[index] ?? ""),
     }))
     .filter((student) => student.name);
 
@@ -238,12 +284,13 @@ export async function saveClassRoster(formData: FormData) {
   const classGroupIdSet = new Set(classGroupIds);
   const handledExistingIds = new Set<string>();
   const savedStudentIds: Record<string, string> = {};
+  let blankGenderNeedsSchemaUpdate = false;
   let nextSortOrder = 1;
 
   for (const [index, name] of names.entries()) {
     const id = studentIds[index] ?? "";
     const rowKey = rowKeys[index] ?? "";
-    const gender = genders[index] === "female" ? "female" : "male";
+    const gender = nullableGender(genders[index] ?? "");
     const groupId = groupIds[index] ?? "";
     const shouldDelete = deleted[index] || !name;
 
@@ -283,7 +330,20 @@ export async function saveClassRoster(formData: FormData) {
         .eq("id", id)
         .eq("class_no", classNo);
       if (error) {
-        throw error;
+        if (gender === null && isStudentGenderConstraintError(error)) {
+          blankGenderNeedsSchemaUpdate = true;
+          const { error: fallbackError } = await supabase
+            .from("students")
+            .update({ name, sort_order: nextSortOrder })
+            .eq("id", id)
+            .eq("class_no", classNo);
+
+          if (fallbackError) {
+            throw fallbackError;
+          }
+        } else {
+          throw error;
+        }
       }
       handledExistingIds.add(id);
     } else {
@@ -293,6 +353,11 @@ export async function saveClassRoster(formData: FormData) {
         .select("id")
         .single();
       if (error) {
+        if (gender === null && isStudentGenderConstraintError(error)) {
+          blankGenderNeedsSchemaUpdate = true;
+          continue;
+        }
+
         throw error;
       }
       savedStudentId = data.id as string;
@@ -347,7 +412,12 @@ export async function saveClassRoster(formData: FormData) {
   revalidatePath("/admin");
   revalidatePath("/");
   if (autoSave) {
-    return { savedStudentIds };
+    return {
+      savedStudentIds,
+      warning: blankGenderNeedsSchemaUpdate
+        ? "성별 빈칸 저장을 위해 DB 업데이트가 필요합니다."
+        : undefined,
+    };
   }
   redirect(adminPath(returnClassNo(formData, classNo)));
 }
@@ -357,10 +427,10 @@ export async function updateStudent(formData: FormData) {
   const id = text(formData, "studentId");
   const classNo = numberValue(formData, "classNo");
   const name = text(formData, "name");
-  const gender = text(formData, "gender");
+  const gender = nullableGender(text(formData, "gender"));
   const sortOrder = numberValue(formData, "sortOrder");
 
-  if (!id || !isClassNumber(classNo) || !name || !["male", "female"].includes(gender)) {
+  if (!id || !isClassNumber(classNo) || !name) {
     redirect(adminErrorPath("bad-student", returnClassNo(formData, classNo)));
   }
 
@@ -567,7 +637,7 @@ export async function setClassGroupCount(formData: FormData) {
   const targetCount = Math.max(0, Math.min(26, numberValue(formData, "groupCount") || 0));
 
   if (!isClassNumber(classNo)) {
-    redirect(adminErrorPath("bad-group", returnClassNo(formData)));
+    throw new Error("Invalid class number.");
   }
 
   const supabase = createServiceSupabase();
@@ -598,7 +668,7 @@ export async function setClassGroupCount(formData: FormData) {
   const occupiedGroupIds = new Set((members ?? []).map((member) => member.group_id as string));
 
   if (targetCount < occupiedGroupIds.size) {
-    redirect(adminErrorPath("group-count-too-low", returnClassNo(formData, classNo)));
+    throw new Error("Group count is lower than the number of occupied groups.");
   }
 
   if (targetCount > activeGroups.length) {
@@ -666,7 +736,7 @@ export async function setClassGroupCount(formData: FormData) {
 
   revalidatePath("/admin");
   revalidatePath("/");
-  redirect(adminPath(returnClassNo(formData, classNo)));
+  return { groups: await activeGroupsForClass(classNo) };
 }
 
 export async function compactClassGroupNames(formData: FormData) {
@@ -674,14 +744,14 @@ export async function compactClassGroupNames(formData: FormData) {
   const classNo = numberValue(formData, "classNo");
 
   if (!isClassNumber(classNo)) {
-    redirect(adminErrorPath("bad-group", returnClassNo(formData)));
+    throw new Error("Invalid class number.");
   }
 
   await compactClassGroupSortOrders(classNo);
 
   revalidatePath("/admin");
   revalidatePath("/");
-  redirect(adminPath(returnClassNo(formData, classNo)));
+  return { groups: await activeGroupsForClass(classNo) };
 }
 
 export async function deleteEmptyGroups(formData: FormData) {
@@ -689,7 +759,7 @@ export async function deleteEmptyGroups(formData: FormData) {
   const classNo = numberValue(formData, "classNo");
 
   if (!isClassNumber(classNo)) {
-    redirect(adminErrorPath("bad-group", returnClassNo(formData)));
+    throw new Error("Invalid class number.");
   }
 
   const supabase = createServiceSupabase();
@@ -732,13 +802,17 @@ export async function deleteEmptyGroups(formData: FormData) {
 
   revalidatePath("/admin");
   revalidatePath("/");
-  redirect(adminPath(returnClassNo(formData, classNo)));
+  return { groups: await activeGroupsForClass(classNo) };
 }
 
 export async function updateGroupPassword(formData: FormData) {
   await requireAdmin();
   const groupId = text(formData, "groupId");
   const password = text(formData, `password-${groupId}`) || text(formData, "password");
+
+  if (!groupId) {
+    throw new Error("Invalid group.");
+  }
 
   const { error } = await createServiceSupabase()
     .from("groups")
@@ -750,7 +824,7 @@ export async function updateGroupPassword(formData: FormData) {
   }
 
   revalidatePath("/admin");
-  redirect(adminPath(returnClassNo(formData)));
+  revalidatePath("/");
 }
 
 export async function moveGroup(formData: FormData) {

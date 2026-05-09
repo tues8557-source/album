@@ -21,10 +21,16 @@ export function safeFileName(name: string): string {
     .slice(0, 120);
 }
 
-export function genderClass(gender: string): string {
-  return gender === "female"
-    ? "bg-pink-100 text-pink-950 ring-pink-200"
-    : "bg-sky-100 text-sky-950 ring-sky-200";
+export function genderClass(gender: string | null | undefined): string {
+  if (gender === "female") {
+    return "bg-pink-100 text-pink-950 ring-pink-200";
+  }
+
+  if (gender === "male") {
+    return "bg-sky-100 text-sky-950 ring-sky-200";
+  }
+
+  return "bg-white text-zinc-700 ring-zinc-300";
 }
 
 export function koDate(value: string): string {

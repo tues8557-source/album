@@ -49,6 +49,15 @@ function transformForVariant(variant: string) {
     };
   }
 
+  if (variant === "editor") {
+    return {
+      width: 2560,
+      height: 2560,
+      resize: "contain" as const,
+      quality: 86,
+    };
+  }
+
   return undefined;
 }
 
@@ -60,7 +69,7 @@ export async function GET(request: Request) {
   const access = String(searchParams.get("access") ?? "").trim();
   const variant = String(searchParams.get("variant") ?? "full").trim();
 
-  if (!classNo || !groupId || !photoId || !["gallery", "viewer", "full"].includes(variant)) {
+  if (!classNo || !groupId || !photoId || !["gallery", "viewer", "editor", "full"].includes(variant)) {
     return errorResponse("이미지 요청 정보를 확인할 수 없습니다.");
   }
 

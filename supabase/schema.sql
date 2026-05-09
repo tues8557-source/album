@@ -4,7 +4,7 @@ create table if not exists public.students (
   id uuid primary key default gen_random_uuid(),
   class_no integer not null check (class_no between 1 and 7),
   name text not null check (char_length(trim(name)) > 0),
-  gender text not null check (gender in ('male', 'female')),
+  gender text check (gender is null or gender in ('male', 'female')),
   sort_order integer not null default 0,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -107,8 +107,11 @@ alter table public.students
   add constraint students_class_no_check check (class_no between 1 and 7);
 
 alter table public.students
+  alter column gender drop not null;
+
+alter table public.students
   drop constraint if exists students_gender_check,
-  add constraint students_gender_check check (gender in ('male', 'female'));
+  add constraint students_gender_check check (gender is null or gender in ('male', 'female'));
 
 alter table public.groups
   drop constraint if exists groups_class_no_check,

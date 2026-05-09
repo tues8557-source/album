@@ -1,4 +1,4 @@
-export type PhotoAssetVariant = "gallery" | "viewer" | "full";
+export type PhotoAssetVariant = "gallery" | "viewer" | "editor" | "full";
 
 export function photoAssetUrl({
   classNo,

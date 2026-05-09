@@ -103,8 +103,11 @@ alter table public.students
   add constraint students_class_no_check check (class_no between 1 and 7);
 
 alter table public.students
+  alter column gender drop not null;
+
+alter table public.students
   drop constraint if exists students_gender_check,
-  add constraint students_gender_check check (gender in ('male', 'female'));
+  add constraint students_gender_check check (gender is null or gender in ('male', 'female'));
 
 alter table public.groups
   drop constraint if exists groups_class_no_check,

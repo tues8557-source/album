@@ -13,6 +13,7 @@ import {
 } from "react";
 import { softDeletePhotos } from "@/app/actions";
 import { DeleteConfirmDialog } from "@/app/delete-confirm-dialog";
+import { DownloadIcon, RotateIcon, TrashIcon } from "@/app/ui/icons";
 import { formatFileSize, koDate } from "@/lib/format";
 import { photoAssetUrl, type PhotoAssetVariant } from "@/lib/photo-assets";
 import type { Photo } from "@/lib/types";
@@ -70,6 +71,8 @@ const MAX_SCALE = 5;
 const MIN_CROP_SIZE = 56;
 const MOBILE_ARROW_HIDE_DELAY = 2000;
 const PHOTOS_PER_PAGE = 20;
+const MAX_EDIT_DIMENSION = 2560;
+const MAX_EDIT_PIXELS = 6_500_000;
 const viewerPrefetchCache = new Map<string, Promise<void>>();
 
 type NetworkInfo = {
@@ -127,26 +130,87 @@ function drawCoverImage(
   );
 }
 
+function fitSizeWithinLimit(width: number, height: number) {
+  let scale = 1;
+  const longestSide = Math.max(width, height);
+
+  if (longestSide > MAX_EDIT_DIMENSION) {
+    scale = Math.min(scale, MAX_EDIT_DIMENSION / longestSide);
+  }
+
+  const scaledPixels = width * height * scale * scale;
+  if (scaledPixels > MAX_EDIT_PIXELS) {
+    scale = Math.min(scale, Math.sqrt(MAX_EDIT_PIXELS / (width * height)));
+  }
+
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
+function prepareCanvasContext(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  mimeType: string | null,
+) {
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+
+  if (blobType(mimeType) === "image/jpeg") {
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, width, height);
+    return;
+  }
+
+  context.clearRect(0, 0, width, height);
+}
+
+function canvasLooksUniform(canvas: HTMLCanvasElement) {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+
+  if (!context || !canvas.width || !canvas.height) {
+    return true;
+  }
+
+  const samplePoints = [
+    [0.15, 0.15],
+    [0.5, 0.15],
+    [0.85, 0.15],
+    [0.15, 0.5],
+    [0.5, 0.5],
+    [0.85, 0.5],
+    [0.15, 0.85],
+    [0.5, 0.85],
+    [0.85, 0.85],
+  ] as const;
+
+  let firstSample = "";
+
+  for (const [xRatio, yRatio] of samplePoints) {
+    const x = Math.max(0, Math.min(canvas.width - 1, Math.round((canvas.width - 1) * xRatio)));
+    const y = Math.max(0, Math.min(canvas.height - 1, Math.round((canvas.height - 1) * yRatio)));
+    const data = context.getImageData(x, y, 1, 1).data;
+    const sample = `${data[0]}-${data[1]}-${data[2]}-${data[3]}`;
+
+    if (!firstSample) {
+      firstSample = sample;
+      continue;
+    }
+
+    if (sample !== firstSample) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function sortPhotosLatestFirst<T extends Photo>(photos: T[]) {
   return [...photos].sort(
     (first, second) =>
       new Date(second.created_at).getTime() - new Date(first.created_at).getTime(),
-  );
-}
-
-function RotateIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      className="h-5 w-5"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.05"
-    >
-      <path d="M8.9 5.1H5.1v3.8" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M5.3 8.9A7.5 7.5 0 1 1 7.3 17" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
   );
 }
 
@@ -181,25 +245,6 @@ function CloseIcon() {
     <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.1">
       <path d="M18 6 6 18" strokeLinecap="round" />
       <path d="m6 6 12 12" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function TrashIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 24 24"
-      className="h-5 w-5"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.05"
-    >
-      <path d="M4.9 6.9h14.2" strokeLinecap="round" />
-      <path d="m8.4 6.9.4-1.6a1 1 0 0 1 1-.8h4.4a1 1 0 0 1 1 .8l.4 1.6" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="m7.5 6.9.7 10.7a1.5 1.5 0 0 0 1.5 1.4h4.6a1.5 1.5 0 0 0 1.5-1.4l.7-10.7" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M10 10.2v5.1" strokeLinecap="round" />
-      <path d="M14 10.2v5.1" strokeLinecap="round" />
     </svg>
   );
 }
@@ -381,6 +426,44 @@ function shouldPrefetchViewerImages() {
   }
 
   return !connection.saveData && !String(connection.effectiveType ?? "").includes("2g");
+}
+
+function shouldPreferNativePhotoShare() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  return window.matchMedia("(pointer: coarse)").matches;
+}
+
+function dataUrlToFile(dataUrl: string, fileName: string) {
+  const [header, payload = ""] = dataUrl.split(",");
+  const mimeMatch = /data:([^;]+)/.exec(header ?? "");
+  const mimeType = mimeMatch?.[1] ?? "application/octet-stream";
+  const binary = atob(payload);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return new File([bytes], fileName, { type: mimeType });
+}
+
+function downloadNameForPhoto(originalName: string | null, index: number, mimeType: string | null) {
+  const fallbackExtension =
+    mimeType === "image/png"
+      ? "png"
+      : mimeType === "image/webp"
+        ? "webp"
+        : "jpg";
+  const fallbackName = `photo-${index + 1}.${fallbackExtension}`;
+
+  if (!originalName?.trim()) {
+    return fallbackName;
+  }
+
+  return originalName.replace(/[\\/:*?"<>|]+/g, "-");
 }
 
 function isMobileViewerArrowMode() {
@@ -729,7 +812,8 @@ function PhotoViewer({
   const displayName = photo.original_name ?? "사진";
   const displaySize = formatFileSize(photo.size);
   const viewerPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "viewer");
-  const editorPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "full");
+  const fullPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "full");
+  const editorPhotoUrl = photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "editor");
 
   const imageRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -754,6 +838,7 @@ function PhotoViewer({
   const [loadedImage, setLoadedImage] = useState<(Size & { photoId: string }) | null>(null);
   const [stageSize, setStageSize] = useState<Size | null>(null);
   const [saving, setSaving] = useState<"rotate" | "crop" | null>(null);
+  const [downloading, setDownloading] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [mobileArrowSide, setMobileArrowSide] = useState<MobileArrowSide>(null);
@@ -766,6 +851,12 @@ function PhotoViewer({
 
   const canMove = photos.length > 1;
   const viewerReady = viewerImage.photoId === photo.id && viewerImageState === "loaded";
+  const savingMessage =
+    saving === "rotate"
+      ? "회전한 사진을 저장하는 중입니다."
+      : saving === "crop"
+        ? "자른 사진을 저장하는 중입니다."
+        : "";
 
   const clearMobileArrowHideTimeout = useCallback(() => {
     if (mobileArrowHideTimeoutRef.current !== null) {
@@ -817,6 +908,15 @@ function PhotoViewer({
     setMobileArrowSide(null);
     return false;
   }, [clearMobileArrowHideTimeout, scheduleMobileArrowHide]);
+
+  const showMobileNavigationArrow = useCallback((direction: "prev" | "next") => {
+    if (!isMobileViewerArrowMode()) {
+      return;
+    }
+
+    setMobileArrowSide(direction === "prev" ? "left" : "right");
+    scheduleMobileArrowHide();
+  }, [scheduleMobileArrowHide]);
 
   const resetView = useCallback(() => {
     setTransform({ scale: 1, x: 0, y: 0 });
@@ -1161,7 +1261,9 @@ function PhotoViewer({
 
       if (transform.scale === 1 && Math.abs(dx) > 72 && Math.abs(dx) > Math.abs(dy) * 1.4) {
         suppressNavigationClick.current = true;
-        void movePhoto(dx < 0 ? "next" : "prev");
+        const direction = dx < 0 ? "next" : "prev";
+        void movePhoto(direction);
+        showMobileNavigationArrow(direction);
         window.setTimeout(() => {
           suppressNavigationClick.current = false;
         }, 250);
@@ -1189,10 +1291,7 @@ function PhotoViewer({
           if (direction) {
             suppressNavigationClick.current = true;
             void movePhoto(direction);
-            if (mobileArrowMode) {
-              setMobileArrowSide(direction === "prev" ? "left" : "right");
-              scheduleMobileArrowHide();
-            }
+            showMobileNavigationArrow(direction);
             window.setTimeout(() => {
               suppressNavigationClick.current = false;
             }, 250);
@@ -1452,36 +1551,63 @@ function PhotoViewer({
   }
 
   async function createRotatedCanvas() {
-    const image = await loadImageElement(editorPhotoUrl);
-    const canvas = document.createElement("canvas");
+    const sourceUrls = photo.url
+      ? [photo.url]
+      : [editorPhotoUrl, viewerPhotoUrl, fullPhotoUrl];
 
-    if (normalizedRotation === 90 || normalizedRotation === 270) {
-      canvas.width = image.naturalHeight;
-      canvas.height = image.naturalWidth;
-    } else {
-      canvas.width = image.naturalWidth;
-      canvas.height = image.naturalHeight;
+    let lastError: Error | null = null;
+
+    for (const sourceUrl of sourceUrls) {
+      try {
+        const image = await loadImageElement(sourceUrl);
+        const sourceSize = fitSizeWithinLimit(image.naturalWidth, image.naturalHeight);
+        const canvas = document.createElement("canvas");
+
+        if (normalizedRotation === 90 || normalizedRotation === 270) {
+          canvas.width = sourceSize.height;
+          canvas.height = sourceSize.width;
+        } else {
+          canvas.width = sourceSize.width;
+          canvas.height = sourceSize.height;
+        }
+
+        const context = canvas.getContext("2d");
+
+        if (!context) {
+          throw new Error("사진을 편집할 수 없습니다.");
+        }
+
+        prepareCanvasContext(context, canvas.width, canvas.height, photo.mime_type);
+
+        if (normalizedRotation === 90) {
+          context.translate(canvas.width, 0);
+          context.rotate(Math.PI / 2);
+        } else if (normalizedRotation === 180) {
+          context.translate(canvas.width, canvas.height);
+          context.rotate(Math.PI);
+        } else if (normalizedRotation === 270) {
+          context.translate(0, canvas.height);
+          context.rotate(-Math.PI / 2);
+        }
+
+        context.drawImage(image, 0, 0, sourceSize.width, sourceSize.height);
+
+        if (
+          canvasLooksUniform(canvas) &&
+          sourceUrl !== sourceUrls[sourceUrls.length - 1]
+        ) {
+          lastError = new Error("편집용 이미지 렌더링이 비어 있습니다.");
+          continue;
+        }
+
+        return canvas;
+      } catch (error) {
+        lastError =
+          error instanceof Error ? error : new Error("사진을 편집할 수 없습니다.");
+      }
     }
 
-    const context = canvas.getContext("2d");
-
-    if (!context) {
-      throw new Error("사진을 편집할 수 없습니다.");
-    }
-
-    if (normalizedRotation === 90) {
-      context.translate(canvas.width, 0);
-      context.rotate(Math.PI / 2);
-    } else if (normalizedRotation === 180) {
-      context.translate(canvas.width, canvas.height);
-      context.rotate(Math.PI);
-    } else if (normalizedRotation === 270) {
-      context.translate(0, canvas.height);
-      context.rotate(-Math.PI / 2);
-    }
-
-    context.drawImage(image, 0, 0);
-    return canvas;
+    throw lastError ?? new Error("사진을 편집할 수 없습니다.");
   }
 
   async function saveRotatedCounterClockwise() {
@@ -1532,6 +1658,8 @@ function PhotoViewer({
         throw new Error("사진을 편집할 수 없습니다.");
       }
 
+      prepareCanvasContext(context, canvas.width, canvas.height, photo.mime_type);
+
       drawCoverImage(
         context,
         editedCanvas,
@@ -1555,6 +1683,80 @@ function PhotoViewer({
 
     if (rotation % 360 !== 0) {
       await saveRotatedCounterClockwise();
+    }
+  }
+
+  async function downloadCurrentPhoto() {
+    let objectUrl = "";
+
+    try {
+      setDownloading(true);
+      const fileName = downloadNameForPhoto(photo.original_name, index, photo.mime_type);
+
+      if (shouldPreferNativePhotoShare()) {
+        const image = imageRef.current;
+
+        if (
+          image?.naturalWidth &&
+          image.naturalHeight &&
+          typeof navigator.share === "function"
+        ) {
+          const canvas = document.createElement("canvas");
+          canvas.width = image.naturalWidth;
+          canvas.height = image.naturalHeight;
+          const context = canvas.getContext("2d");
+
+          if (context) {
+            prepareCanvasContext(context, canvas.width, canvas.height, photo.mime_type);
+            context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+            const file = dataUrlToFile(
+              canvas.toDataURL(blobType(photo.mime_type), 0.92),
+              fileName,
+            );
+            const shareData = { files: [file], title: file.name };
+
+            if (!navigator.canShare || navigator.canShare(shareData)) {
+              try {
+                await navigator.share(shareData);
+                return;
+              } catch (error) {
+                if (error instanceof DOMException && error.name === "AbortError") {
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      const response = await fetch(fullPhotoUrl, {
+        method: "GET",
+        credentials: "same-origin",
+      });
+
+      if (!response.ok) {
+        throw new Error("사진 내려받기에 실패했습니다.");
+      }
+
+      const blob = await response.blob();
+      objectUrl = URL.createObjectURL(blob);
+
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = downloadNameForPhoto(photo.original_name, index, blob.type || photo.mime_type);
+      link.rel = "noopener";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "사진 내려받기에 실패했습니다.");
+    } finally {
+      setDownloading(false);
+
+      if (objectUrl) {
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      }
     }
   }
 
@@ -1599,14 +1801,18 @@ function PhotoViewer({
         <div className="min-w-0 pt-0.5">
           <p className="text-sm font-semibold">{currentLabel}</p>
           <p className="truncate text-sm text-zinc-300">{displayName} · {displaySize}</p>
+          {savingMessage ? (
+            <p className="mt-1 text-xs font-medium text-teal-300">{savingMessage}</p>
+          ) : null}
         </div>
         <button
           type="button"
           onClick={onClose}
           aria-label="닫기"
-          className="mt-[1.35rem] shrink-0 px-1 text-[13px] font-medium leading-none text-zinc-300 hover:text-white"
+          disabled={Boolean(saving) || deleting}
+          className="mt-[1.35rem] shrink-0 px-1 text-[13px] font-medium leading-none text-zinc-300 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
         >
-          닫기
+          {savingMessage ? "저장 중" : "닫기"}
         </button>
       </header>
 
@@ -1619,6 +1825,15 @@ function PhotoViewer({
         onPointerCancel={handlePointerUp}
         className="relative min-h-0 overflow-hidden touch-none select-none bg-black"
       >
+        {savingMessage ? (
+          <div className="absolute inset-0 z-40 grid place-items-center bg-black/36 backdrop-blur-[1px]">
+            <div className="rounded-xl border border-white/12 bg-black/84 px-4 py-3 text-center shadow-xl">
+              <div className="mx-auto h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+              <p className="mt-2 text-sm font-semibold text-white">저장 중</p>
+              <p className="mt-1 text-xs text-zinc-300">{savingMessage} 잠시만 기다려 주세요.</p>
+            </div>
+          </div>
+        ) : null}
         <button
           type="button"
           aria-label="이전 사진"
@@ -1837,6 +2052,16 @@ function PhotoViewer({
           >
             <SaveIcon />
             <span className="hidden sm:inline">{saving ? "저장 중" : "저장"}</span>
+          </button>
+          <button
+            type="button"
+            aria-label={downloading ? "내려받는 중" : "내려받기"}
+            disabled={Boolean(saving) || downloading || deleting || !viewerReady}
+            onClick={() => void downloadCurrentPhoto()}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400 sm:w-auto sm:px-3"
+          >
+            <DownloadIcon />
+            <span className="hidden sm:inline">{downloading ? "내려받는 중" : "내려받기"}</span>
           </button>
         </div>
         <div className="shrink-0">

@@ -48,13 +48,13 @@ export default async function Home({
           <div className="flex shrink-0 flex-wrap justify-end gap-2">
             <Link
               href="/admin"
-              className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 shadow-sm"
+              className="inline-flex min-h-10 items-center justify-center rounded-md bg-zinc-900 px-3 py-2 text-base font-semibold leading-none text-white"
             >
               관리자
             </Link>
             {admin ? (
               <form action={logoutAdmin} suppressHydrationWarning>
-                <button className="rounded-md bg-zinc-900 px-3 py-2 text-sm font-semibold text-white shadow-sm">
+                <button className="inline-flex min-h-10 items-center justify-center rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold leading-none">
                   로그아웃
                 </button>
               </form>

@@ -7,7 +7,7 @@ export type Student = {
   id: string;
   class_no: number;
   name: string;
-  gender: Gender;
+  gender: Gender | null;
   sort_order: number;
 };
 

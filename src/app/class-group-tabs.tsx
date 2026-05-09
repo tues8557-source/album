@@ -86,44 +86,52 @@ export function ClassGroupTabs({
                 <form
                   action={loginGroup}
                   autoComplete="off"
-                  className="mt-4 grid grid-cols-[minmax(0,1fr)_auto] gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]"
+                  className="mt-4 grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]"
                   suppressHydrationWarning
                 >
                   <input type="hidden" name="classNo" value={activeClass.classNo} />
                   <input type="hidden" name="groupId" value={group.id} />
-                  <input
-                    id={`group-password-${group.id}`}
-                    name={`password-${group.id}`}
-                    type={passwordVisible ? "text" : "password"}
-                    autoComplete="new-password"
-                    data-1p-ignore="true"
-                    data-lpignore="true"
-                    disabled={!hasPassword}
-                    placeholder={hasPassword ? "그룹 비밀번호" : "비밀번호 없음"}
-                    className="min-h-11 min-w-0 rounded-md border border-zinc-300 bg-white px-3 text-sm disabled:bg-zinc-100 disabled:text-zinc-400"
-                    suppressHydrationWarning
-                  />
-                  <button
-                    type="button"
-                    title={passwordVisible ? "비밀번호 숨기기" : "비밀번호 보기"}
-                    aria-label={passwordVisible ? "비밀번호 숨기기" : "비밀번호 보기"}
-                    disabled={!hasPassword}
-                    onClick={() =>
-                      setVisiblePasswordGroups((current) => {
-                        const next = new Set(current);
-                        if (next.has(group.id)) {
-                          next.delete(group.id);
-                        } else {
-                          next.add(group.id);
-                        }
-                        return next;
-                      })
-                    }
-                    className="grid min-h-11 w-11 place-items-center rounded-md border border-zinc-300 bg-white text-zinc-700 disabled:cursor-not-allowed disabled:bg-zinc-100 disabled:text-zinc-400"
+                  <div
+                    className={`flex min-w-0 items-stretch rounded-md border ${
+                      hasPassword
+                        ? "border-zinc-300 bg-white focus-within:border-teal-500"
+                        : "border-zinc-300 bg-zinc-100"
+                    }`}
                   >
-                    {passwordVisible ? <EyeOffIcon /> : <EyeIcon />}
-                  </button>
-                  <button className="col-span-2 rounded-md bg-zinc-900 px-4 py-2 text-sm font-semibold text-white sm:col-span-1">
+                    <input
+                      id={`group-password-${group.id}`}
+                      name={`password-${group.id}`}
+                      type={passwordVisible ? "text" : "password"}
+                      autoComplete="new-password"
+                      data-1p-ignore="true"
+                      data-lpignore="true"
+                      disabled={!hasPassword}
+                      placeholder={hasPassword ? "그룹 비밀번호" : "비밀번호 없음"}
+                      className="min-h-11 min-w-0 flex-1 bg-transparent px-3 text-sm outline-none disabled:text-zinc-400"
+                      suppressHydrationWarning
+                    />
+                    <button
+                      type="button"
+                      title={passwordVisible ? "비밀번호 숨기기" : "비밀번호 보기"}
+                      aria-label={passwordVisible ? "비밀번호 숨기기" : "비밀번호 보기"}
+                      disabled={!hasPassword}
+                      onClick={() =>
+                        setVisiblePasswordGroups((current) => {
+                          const next = new Set(current);
+                          if (next.has(group.id)) {
+                            next.delete(group.id);
+                          } else {
+                            next.add(group.id);
+                          }
+                          return next;
+                        })
+                      }
+                      className="grid min-h-11 w-10 shrink-0 place-items-center text-zinc-700 disabled:cursor-not-allowed disabled:text-zinc-400"
+                    >
+                      {passwordVisible ? <EyeIcon /> : <EyeOffIcon />}
+                    </button>
+                  </div>
+                  <button className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-semibold text-white">
                     입장
                   </button>
                 </form>
