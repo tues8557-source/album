@@ -1,7 +1,5 @@
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
-import { revalidatePath, revalidateTag } from "next/cache";
-import { activePhotosTag, deletedPhotosTag } from "@/lib/photo-assets";
 import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
 import { createServiceSupabase } from "@/lib/supabase/server";
 
@@ -25,32 +23,35 @@ async function canAccessGroup(classNo: number, groupId: string, access: string) 
   return admin || !group.password_hash || groupSession;
 }
 
-export async function POST(request: Request) {
-  const body = await request.json().catch(() => null);
-  const classNo = Number.parseInt(String(body?.classNo ?? ""), 10);
-  const groupId = String(body?.groupId ?? "").trim();
-  const access = String(body?.access ?? "").trim();
-  const photoId = String(body?.photoId ?? "").trim();
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const classNo = Number.parseInt(searchParams.get("classNo") ?? "", 10);
+  const groupId = String(searchParams.get("groupId") ?? "").trim();
+  const access = String(searchParams.get("access") ?? "").trim();
 
-  if (!classNo || !groupId || !photoId || !(await canAccessGroup(classNo, groupId, access))) {
+  if (!classNo || !groupId || !(await canAccessGroup(classNo, groupId, access))) {
     return NextResponse.json({ error: "권한을 확인할 수 없습니다." }, { status: 403 });
   }
 
-  const { error } = await createServiceSupabase()
+  const { data, error } = await createServiceSupabase()
     .from("photos")
-    .update({ deleted_at: new Date().toISOString() })
-    .eq("id", photoId)
+    .select("id, group_id, storage_path, original_name, mime_type, size, is_favorite, created_at, deleted_at")
     .eq("group_id", groupId)
-    .is("deleted_at", null);
+    .is("deleted_at", null)
+    .order("created_at", { ascending: false });
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  revalidateTag(activePhotosTag(groupId), "max");
-  revalidateTag(deletedPhotosTag(groupId), "max");
-  revalidatePath(`/classes/${classNo}/groups/${groupId}`);
-  revalidatePath(`/classes/${classNo}/groups/${groupId}/trash`);
-
-  return NextResponse.json({ deleted: true });
+  return NextResponse.json({
+    photos: (data ?? []).map((photo) => ({
+      ...photo,
+      is_favorite: Boolean(photo.is_favorite),
+    })),
+  }, {
+    headers: {
+      "cache-control": "no-store, no-cache, must-revalidate",
+    },
+  });
 }

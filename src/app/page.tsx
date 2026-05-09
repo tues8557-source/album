@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 export default async function Home({
   searchParams,
 }: {
-  searchParams: Promise<{ classNo?: string; errorGroupId?: string }>;
+  searchParams: Promise<{ classNo?: string; errorGroupId?: string; staleGroupId?: string }>;
 }) {
   const params = await searchParams;
   const requestedClassNo = Number.parseInt(params.classNo ?? "", 10);
@@ -66,6 +66,7 @@ export default async function Home({
           classData={classData}
           initialClassNo={initialClassNo}
           errorGroupId={params.errorGroupId}
+          staleGroupId={params.staleGroupId}
         />
       </section>
     </main>

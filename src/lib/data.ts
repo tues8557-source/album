@@ -6,6 +6,13 @@ import { activePhotosTag, deletedPhotosTag } from "./photo-assets";
 import { CLASS_NUMBERS } from "./types";
 import type { Group, GroupMember, Photo, Student } from "./types";
 
+function normalizePhotoRecord(record: Record<string, unknown>) {
+  return {
+    ...record,
+    is_favorite: Boolean(record.is_favorite),
+  } as Photo;
+}
+
 export async function ensureInitialClassGroups(targetCount = 6) {
   const supabase = createServiceSupabase();
 
@@ -264,7 +271,7 @@ export async function getPhotos(groupId: string, deleted: boolean) {
         throw error;
       }
 
-      return (data ?? []) as Photo[];
+      return (data ?? []).map((photo) => normalizePhotoRecord(photo as Record<string, unknown>));
     },
     ["photos", groupId, deleted ? "deleted" : "active"],
     { tags: [deleted ? deletedPhotosTag(groupId) : activePhotosTag(groupId)] },
@@ -281,7 +288,7 @@ export async function getPhotoUrls(photos: Photo[]) {
         .createSignedUrl(photo.storage_path, 60 * 10);
 
       return {
-        ...photo,
+        ...normalizePhotoRecord(photo as unknown as Record<string, unknown>),
         url: data?.signedUrl ?? "",
       };
     }),

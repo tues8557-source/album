@@ -7,9 +7,43 @@ import { TrashEmptyForm } from "@/app/classes/[classNo]/groups/[groupId]/trash/t
 import { getClassGroups, getGroup, getPhotos } from "@/lib/data";
 import { groupName, koDate } from "@/lib/format";
 import { photoAssetUrl } from "@/lib/photo-assets";
-import { readSignedToken } from "@/lib/security";
+import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
 
 export const dynamic = "force-dynamic";
+
+function staleGroupHomePath(classNo: number, groupId: string) {
+  const params = new URLSearchParams({
+    classNo: String(classNo),
+    staleGroupId: groupId,
+  });
+
+  return `/?${params.toString()}`;
+}
+
+async function getGroupAccessState(
+  groupId: string,
+  passwordHash: string | null,
+  accessNonce: string | null,
+  access: string,
+) {
+  if (!passwordHash) {
+    return "granted" as const;
+  }
+
+  const store = await cookies();
+  const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
+  if (admin) {
+    return "granted" as const;
+  }
+
+  if (!access) {
+    return "prompt" as const;
+  }
+
+  return hasValidGroupAccessToken(access, groupId, accessNonce)
+    ? "granted" as const
+    : "stale" as const;
+}
 
 export default async function TrashPage({
   params,
@@ -27,10 +61,18 @@ export default async function TrashPage({
     notFound();
   }
 
-  const store = await cookies();
-  const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  const groupSession = readSignedToken(access) === `group:${groupId}`;
-  if (group.password_hash && !admin && !groupSession) {
+  const accessState = await getGroupAccessState(
+    groupId,
+    group.password_hash,
+    group.access_nonce,
+    access,
+  );
+
+  if (accessState === "stale") {
+    redirect(staleGroupHomePath(classNo, groupId));
+  }
+
+  if (accessState === "prompt") {
     redirect(`/classes/${classNo}/groups/${groupId}`);
   }
 

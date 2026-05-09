@@ -2,7 +2,7 @@ import { randomUUID } from "crypto";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import { safeFileName } from "@/lib/format";
-import { readSignedToken } from "@/lib/security";
+import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
 import { createServiceSupabase } from "@/lib/supabase/server";
 
 const ALLOWED_EXTENSIONS = /\.(jpe?g|png|gif|webp|heic|heif)$/i;
@@ -19,7 +19,7 @@ async function canAccessGroup(classNo: number, groupId: string, access: string) 
   const supabase = createServiceSupabase();
   const { data: group, error } = await supabase
     .from("groups")
-    .select("password_hash")
+    .select("*")
     .eq("id", groupId)
     .eq("class_no", classNo)
     .is("deleted_at", null)
@@ -31,7 +31,7 @@ async function canAccessGroup(classNo: number, groupId: string, access: string) 
 
   const store = await cookies();
   const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  const groupSession = readSignedToken(access) === `group:${groupId}`;
+  const groupSession = hasValidGroupAccessToken(access, groupId, group.access_nonce);
   return admin || !group.password_hash || groupSession;
 }
 

@@ -11,16 +11,14 @@ import { groupName, isClassNumber, safeFileName } from "@/lib/format";
 import type { Group } from "@/lib/types";
 import {
   createSignedToken,
+  createGroupAccessToken,
   isAdminPassword,
+  hasValidGroupAccessToken,
   readSignedToken,
   verifyPassword,
 } from "@/lib/security";
 
 const ADMIN_COOKIE = "album_admin";
-
-function groupAccessValue(groupId: string) {
-  return `group:${groupId}`;
-}
 
 function text(formData: FormData, key: string) {
   return String(formData.get(key) ?? "").trim();
@@ -67,6 +65,29 @@ function adminErrorPath(error: string, classNo?: number) {
   return `${adminPath(classNo)}${separator}error=${error}`;
 }
 
+function homePathForGroup(
+  classNo: number,
+  {
+    errorGroupId,
+    staleGroupId,
+  }: {
+    errorGroupId?: string;
+    staleGroupId?: string;
+  },
+) {
+  const params = new URLSearchParams({ classNo: String(classNo) });
+
+  if (errorGroupId) {
+    params.set("errorGroupId", errorGroupId);
+  }
+
+  if (staleGroupId) {
+    params.set("staleGroupId", staleGroupId);
+  }
+
+  return `/?${params.toString()}`;
+}
+
 function returnClassNo(formData: FormData, fallback?: number) {
   const classNo = numberValue(formData, "returnClassNo");
   return isClassNumber(classNo) ? classNo : fallback;
@@ -107,7 +128,7 @@ async function requireGroupAccess(groupId: string, classNo: number, accessToken:
 
   const { data: group, error } = await createServiceSupabase()
     .from("groups")
-    .select("password_hash")
+    .select("*")
     .eq("id", groupId)
     .eq("class_no", classNo)
     .is("deleted_at", null)
@@ -121,8 +142,12 @@ async function requireGroupAccess(groupId: string, classNo: number, accessToken:
     return;
   }
 
-  if (readSignedToken(accessToken) !== groupAccessValue(groupId)) {
+  if (!accessToken) {
     redirect(`/classes/${classNo}/groups/${groupId}`);
+  }
+
+  if (!hasValidGroupAccessToken(accessToken, groupId, group.access_nonce)) {
+    redirect(homePathForGroup(classNo, { staleGroupId: groupId }));
   }
 }
 
@@ -154,17 +179,17 @@ export async function loginGroup(formData: FormData) {
 
   const { data: group, error } = await supabase
     .from("groups")
-    .select("id, password_hash")
+    .select("*")
     .eq("id", groupId)
     .eq("class_no", classNo)
     .is("deleted_at", null)
     .single();
 
   if (error || !group || (group.password_hash && !admin && !verifyPassword(password, group.password_hash))) {
-    redirect(`/?classNo=${classNo}&errorGroupId=${groupId}`);
+    redirect(homePathForGroup(classNo, { errorGroupId: groupId }));
   }
 
-  const access = encodeURIComponent(createSignedToken(groupAccessValue(groupId)));
+  const access = encodeURIComponent(createGroupAccessToken(groupId, group.access_nonce));
   redirect(`/classes/${classNo}/groups/${groupId}?access=${access}`);
 }
 
@@ -809,18 +834,38 @@ export async function updateGroupPassword(formData: FormData) {
   await requireAdmin();
   const groupId = text(formData, "groupId");
   const password = text(formData, `password-${groupId}`) || text(formData, "password");
+  const nextAccessNonce = randomUUID();
 
   if (!groupId) {
     throw new Error("Invalid group.");
   }
 
-  const { error } = await createServiceSupabase()
+  const supabase = createServiceSupabase();
+  let result = await supabase
     .from("groups")
-    .update({ password_hash: password || null })
-    .eq("id", groupId);
+    .update({ password_hash: password || null, access_nonce: nextAccessNonce })
+    .eq("id", groupId)
+    .select("*")
+    .single();
 
-  if (error) {
-    throw error;
+  if (result.error?.code === "42703") {
+    result = await supabase
+      .from("groups")
+      .update({ password_hash: password || null })
+      .eq("id", groupId)
+      .select("*")
+      .single();
+  }
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  const group = result.data as Group | null;
+
+  if (group?.class_no) {
+    revalidatePath(`/classes/${group.class_no}/groups/${groupId}`);
+    revalidatePath(`/classes/${group.class_no}/groups/${groupId}/trash`);
   }
 
   revalidatePath("/admin");

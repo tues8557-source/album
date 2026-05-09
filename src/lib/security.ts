@@ -31,6 +31,14 @@ export function createSignedToken(value: string): string {
   return `${value}.${sign(value)}`;
 }
 
+function groupAccessValue(groupId: string, accessNonce?: string | null) {
+  return accessNonce ? `group:${groupId}:${accessNonce}` : `group:${groupId}`;
+}
+
+export function createGroupAccessToken(groupId: string, accessNonce?: string | null) {
+  return createSignedToken(groupAccessValue(groupId, accessNonce));
+}
+
 export function readSignedToken(token: string | undefined): string | null {
   if (!token) {
     return null;
@@ -51,6 +59,14 @@ export function readSignedToken(token: string | undefined): string | null {
   }
 
   return value;
+}
+
+export function hasValidGroupAccessToken(
+  token: string | undefined,
+  groupId: string,
+  accessNonce?: string | null,
+) {
+  return readSignedToken(token) === groupAccessValue(groupId, accessNonce);
 }
 
 export function isAdminPassword(password: string): boolean {

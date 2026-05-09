@@ -1,23 +1,46 @@
 import { cookies } from "next/headers";
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { PhotoGallery } from "@/app/classes/[classNo]/groups/[groupId]/photo-gallery";
 import { PhotoUploadForm } from "@/app/classes/[classNo]/groups/[groupId]/photo-upload-form";
 import { getClassGroups, getGroup, getGroupMembers, getPhotos } from "@/lib/data";
 import { genderClass, groupName } from "@/lib/format";
-import { readSignedToken } from "@/lib/security";
+import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
 
 export const dynamic = "force-dynamic";
 
-async function hasGroupAccess(groupId: string, passwordHash: string | null, access: string) {
+function staleGroupHomePath(classNo: number, groupId: string) {
+  const params = new URLSearchParams({
+    classNo: String(classNo),
+    staleGroupId: groupId,
+  });
+
+  return `/?${params.toString()}`;
+}
+
+async function getGroupAccessState(
+  groupId: string,
+  passwordHash: string | null,
+  accessNonce: string | null,
+  access: string,
+) {
   if (!passwordHash) {
-    return true;
+    return "granted" as const;
   }
 
   const store = await cookies();
   const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  const group = readSignedToken(access) === `group:${groupId}`;
-  return admin || group;
+  if (admin) {
+    return "granted" as const;
+  }
+
+  if (!access) {
+    return "prompt" as const;
+  }
+
+  return hasValidGroupAccessToken(access, groupId, accessNonce)
+    ? "granted" as const
+    : "stale" as const;
 }
 
 export default async function GroupPage({
@@ -39,9 +62,18 @@ export default async function GroupPage({
   const { groups } = await getClassGroups(classNo);
   const currentGroup = groups.find((item) => item.id === groupId);
   const label = currentGroup ? groupName(classNo, Math.max(0, currentGroup.sort_order - 1)) : "그룹";
-  const canView = await hasGroupAccess(groupId, group.password_hash, access);
+  const accessState = await getGroupAccessState(
+    groupId,
+    group.password_hash,
+    group.access_nonce,
+    access,
+  );
 
-  if (!canView) {
+  if (accessState === "stale") {
+    redirect(staleGroupHomePath(classNo, groupId));
+  }
+
+  if (accessState === "prompt") {
     return (
       <main className="min-h-screen bg-stone-50 px-4 py-8 text-zinc-950">
         <section className="mx-auto max-w-sm rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">

@@ -38,6 +38,7 @@ create table if not exists public.groups (
   class_no integer not null check (class_no between 1 and 7),
   sort_order integer not null default 0,
   password_hash text,
+  access_nonce uuid not null default gen_random_uuid(),
   deleted_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -47,6 +48,7 @@ alter table public.groups
   add column if not exists class_no integer,
   add column if not exists sort_order integer not null default 0,
   add column if not exists password_hash text,
+  add column if not exists access_nonce uuid default gen_random_uuid(),
   add column if not exists deleted_at timestamptz,
   add column if not exists created_at timestamptz not null default now(),
   add column if not exists updated_at timestamptz not null default now();
@@ -87,6 +89,7 @@ create table if not exists public.photos (
   original_name text,
   mime_type text,
   size bigint,
+  is_favorite boolean not null default false,
   deleted_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -98,9 +101,18 @@ alter table public.photos
   add column if not exists original_name text,
   add column if not exists mime_type text,
   add column if not exists size bigint,
+  add column if not exists is_favorite boolean default false,
   add column if not exists deleted_at timestamptz,
   add column if not exists created_at timestamptz not null default now(),
   add column if not exists updated_at timestamptz not null default now();
+
+update public.photos
+set is_favorite = false
+where is_favorite is null;
+
+alter table public.photos
+  alter column is_favorite set default false,
+  alter column is_favorite set not null;
 
 alter table public.students
   drop constraint if exists students_class_no_check,
@@ -116,6 +128,14 @@ alter table public.students
 alter table public.groups
   drop constraint if exists groups_class_no_check,
   add constraint groups_class_no_check check (class_no between 1 and 7);
+
+update public.groups
+set access_nonce = gen_random_uuid()
+where access_nonce is null;
+
+alter table public.groups
+  alter column access_nonce set default gen_random_uuid(),
+  alter column access_nonce set not null;
 
 create index if not exists students_class_sort_idx on public.students(class_no, sort_order);
 create index if not exists groups_class_sort_active_idx on public.groups(class_no, sort_order)

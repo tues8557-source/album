@@ -15,10 +15,12 @@ export function ClassGroupTabs({
   classData,
   initialClassNo,
   errorGroupId,
+  staleGroupId,
 }: {
   classData: ClassData[];
   initialClassNo: ClassNumber;
   errorGroupId?: string;
+  staleGroupId?: string;
 }) {
   const [activeClassNo, setActiveClassNo] = useState<ClassNumber>(initialClassNo);
   const [visiblePasswordGroups, setVisiblePasswordGroups] = useState<Set<string>>(new Set());
@@ -62,7 +64,10 @@ export function ClassGroupTabs({
                   <p className="text-lg font-bold">{label}</p>
                   <span className="text-sm text-zinc-500">{members.length}명</span>
                 </div>
-                {errorGroupId === group.id ? (
+                {staleGroupId === group.id ? (
+                  <p className="mt-2 text-sm text-amber-700">비밀번호가 변경되어 다시 입장해야 합니다.</p>
+                ) : null}
+                {staleGroupId !== group.id && errorGroupId === group.id ? (
                   <p className="mt-2 text-sm text-red-600">그룹 비밀번호를 확인하세요.</p>
                 ) : null}
                 <div className="mt-3 flex flex-wrap gap-2">

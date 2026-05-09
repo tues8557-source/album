@@ -11,9 +11,10 @@ import {
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import { softDeletePhotos } from "@/app/actions";
 import { DeleteConfirmDialog } from "@/app/delete-confirm-dialog";
-import { DownloadIcon, RotateIcon, TrashIcon } from "@/app/ui/icons";
+import { DownloadIcon, HeartIcon, RotateIcon, TrashIcon } from "@/app/ui/icons";
 import { formatFileSize, koDate } from "@/lib/format";
 import { photoAssetUrl, type PhotoAssetVariant } from "@/lib/photo-assets";
 import type { Photo } from "@/lib/types";
@@ -31,6 +32,24 @@ type EditedPhotoResponse = {
 type DeletePhotoResponse = {
   deleted?: boolean;
   error?: string;
+};
+
+type FavoritePhotoResponse = {
+  saved?: boolean;
+  favorite?: boolean;
+  error?: string;
+};
+
+type SyncPhotosResponse = {
+  photos?: Photo[];
+  error?: string;
+};
+
+type ViewerHistoryState = {
+  __albumViewer?: {
+    key: string;
+    index: number;
+  };
 };
 
 type ViewerTransform = {
@@ -73,6 +92,7 @@ const MOBILE_ARROW_HIDE_DELAY = 2000;
 const PHOTOS_PER_PAGE = 20;
 const MAX_EDIT_DIMENSION = 2560;
 const MAX_EDIT_PIXELS = 6_500_000;
+const PHOTO_SYNC_INTERVAL = 2000;
 const viewerPrefetchCache = new Map<string, Promise<void>>();
 
 type NetworkInfo = {
@@ -212,6 +232,60 @@ function sortPhotosLatestFirst<T extends Photo>(photos: T[]) {
     (first, second) =>
       new Date(second.created_at).getTime() - new Date(first.created_at).getTime(),
   );
+}
+
+function isFavoritePhoto(photo: { is_favorite?: boolean | null }) {
+  return Boolean(photo.is_favorite);
+}
+
+function staleGroupHomePath(classNo: number, groupId: string) {
+  const params = new URLSearchParams({
+    classNo: String(classNo),
+    staleGroupId: groupId,
+  });
+
+  return `/?${params.toString()}`;
+}
+
+function viewerHistoryKeyForGroup(classNo: number, groupId: string) {
+  return `album-viewer:${classNo}:${groupId}`;
+}
+
+function readViewerHistoryState(state: unknown) {
+  if (!state || typeof state !== "object") {
+    return null;
+  }
+
+  const candidate = state as ViewerHistoryState;
+  if (!candidate.__albumViewer) {
+    return null;
+  }
+
+  return candidate.__albumViewer;
+}
+
+function normalizePhotoPayload(photo: Partial<Photo> & Record<string, unknown>) {
+  const numericSize = typeof photo.size === "number"
+    ? photo.size
+    : typeof photo.size === "string"
+      ? Number(photo.size)
+      : null;
+
+  return {
+    id: String(photo.id ?? ""),
+    group_id: String(photo.group_id ?? ""),
+    storage_path: String(photo.storage_path ?? ""),
+    original_name: typeof photo.original_name === "string" ? photo.original_name : null,
+    mime_type: typeof photo.mime_type === "string" ? photo.mime_type : null,
+    size: numericSize !== null && Number.isFinite(numericSize) ? numericSize : null,
+    is_favorite: Boolean(photo.is_favorite),
+    created_at: typeof photo.created_at === "string" ? photo.created_at : new Date(0).toISOString(),
+    deleted_at: typeof photo.deleted_at === "string"
+      ? photo.deleted_at
+      : photo.deleted_at == null
+        ? null
+        : String(photo.deleted_at),
+  } satisfies Photo;
 }
 
 function CropIcon() {
@@ -487,10 +561,15 @@ export function PhotoGallery({
 }) {
   const router = useRouter();
   const localPreviewUrls = useRef<Map<string, string>>(new Map());
+  const pendingFavoriteValues = useRef<Map<string, boolean>>(new Map());
+  const handlingViewerPopState = useRef(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedPhotoIds, setSelectedPhotoIds] = useState<Set<string>>(() => new Set());
+  const [pendingFavoritePhotoIds, setPendingFavoritePhotoIds] = useState<Set<string>>(() => new Set());
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
-  const [displayPhotos, setDisplayPhotos] = useState<PhotoWithUrl[]>(() => sortPhotosLatestFirst(photos));
+  const [displayPhotos, setDisplayPhotos] = useState<PhotoWithUrl[]>(() =>
+    sortPhotosLatestFirst(photos.map((photo) => normalizePhotoPayload(photo))),
+  );
   const [pageIndex, setPageIndex] = useState(0);
   const [batchDeleteDialogOpen, setBatchDeleteDialogOpen] = useState(false);
   const selectedCount = selectedPhotoIds.size;
@@ -500,11 +579,17 @@ export function PhotoGallery({
   const currentPageIndex = Math.min(pageIndex, pageCount - 1);
   const pageStart = currentPageIndex * PHOTOS_PER_PAGE;
   const visiblePhotos = displayPhotos.slice(pageStart, pageStart + PHOTOS_PER_PAGE);
+  const viewerHistoryKey = viewerHistoryKeyForGroup(classNo, groupId);
+  const viewerIndexRef = useRef<number | null>(viewerIndex);
 
   useEffect(() => {
+    viewerIndexRef.current = viewerIndex;
+  }, [viewerIndex]);
+
+  const syncDisplayPhotos = useCallback((nextPhotos: Photo[]) => {
     setDisplayPhotos((current) => {
       const currentById = new Map(current.map((photo) => [photo.id, photo]));
-      const photoIds = new Set(photos.map((photo) => photo.id));
+      const photoIds = new Set(nextPhotos.map((photo) => photo.id));
 
       for (const [photoId, previewUrl] of localPreviewUrls.current) {
         if (!photoIds.has(photoId)) {
@@ -513,21 +598,116 @@ export function PhotoGallery({
         }
       }
 
-      return sortPhotosLatestFirst(photos.map((photo) => {
+      return sortPhotosLatestFirst(nextPhotos.map((photo) => {
         const previewUrl = localPreviewUrls.current.get(photo.id);
         const currentPhoto = currentById.get(photo.id);
+        const pendingFavorite = pendingFavoriteValues.current.get(photo.id);
+        const favorite = pendingFavorite ?? isFavoritePhoto(photo);
 
         return previewUrl
           ? {
               ...photo,
               mime_type: currentPhoto?.mime_type ?? photo.mime_type,
               size: currentPhoto?.size ?? photo.size,
+              is_favorite: favorite,
               url: previewUrl,
             }
-          : { ...photo };
+          : {
+              ...photo,
+              is_favorite: favorite,
+            };
       }));
     });
-  }, [photos]);
+  }, []);
+
+  const syncPhotosFromServer = useCallback(async () => {
+    const params = new URLSearchParams({
+      classNo: String(classNo),
+      groupId,
+      access,
+    });
+
+    const response = await fetch(`/api/photos/sync?${params.toString()}`, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+
+    if (response.status === 403) {
+      window.location.replace(staleGroupHomePath(classNo, groupId));
+      return;
+    }
+
+    if (!response.ok) {
+      return;
+    }
+
+    const body = (await response.json().catch(() => null)) as SyncPhotosResponse | null;
+    if (!Array.isArray(body?.photos)) {
+      return;
+    }
+
+    syncDisplayPhotos(body.photos.map((photo) => normalizePhotoPayload(photo)));
+  }, [access, classNo, groupId, syncDisplayPhotos]);
+
+  useEffect(() => {
+    syncDisplayPhotos(photos.map((photo) => normalizePhotoPayload(photo)));
+  }, [photos, syncDisplayPhotos]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timerId: number | null = null;
+
+    function clearTimer() {
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+    }
+
+    function schedule(delay = PHOTO_SYNC_INTERVAL) {
+      clearTimer();
+      timerId = window.setTimeout(() => {
+        void tick();
+      }, delay);
+    }
+
+    async function tick() {
+      if (cancelled) {
+        return;
+      }
+
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        schedule();
+        return;
+      }
+
+      try {
+        await syncPhotosFromServer();
+      } finally {
+        schedule();
+      }
+    }
+
+    const handleVisible = () => {
+      if (document.visibilityState === "visible") {
+        void syncPhotosFromServer();
+      }
+    };
+
+    void tick();
+    document.addEventListener("visibilitychange", handleVisible);
+    window.addEventListener("focus", handleVisible);
+    window.addEventListener("pageshow", handleVisible);
+
+    return () => {
+      cancelled = true;
+      clearTimer();
+      document.removeEventListener("visibilitychange", handleVisible);
+      window.removeEventListener("focus", handleVisible);
+      window.removeEventListener("pageshow", handleVisible);
+    };
+  }, [syncPhotosFromServer]);
 
   useEffect(() => {
     const previewUrls = localPreviewUrls.current;
@@ -539,6 +719,71 @@ export function PhotoGallery({
       previewUrls.clear();
     };
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    function handlePopState(event: PopStateEvent) {
+      const viewerState = readViewerHistoryState(event.state);
+      handlingViewerPopState.current = true;
+
+      if (viewerState?.key === viewerHistoryKey && displayPhotos.length) {
+        const nextIndex = clamp(viewerState.index, 0, displayPhotos.length - 1);
+        setViewerIndex(nextIndex);
+      } else {
+        setViewerIndex(null);
+      }
+
+      window.setTimeout(() => {
+        handlingViewerPopState.current = false;
+      }, 0);
+    }
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [displayPhotos.length, viewerHistoryKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || handlingViewerPopState.current) {
+      return;
+    }
+
+    if (viewerIndex === null) {
+      return;
+    }
+
+    const currentState = readViewerHistoryState(window.history.state);
+    const nextState = {
+      ...(window.history.state ?? {}),
+      __albumViewer: {
+        key: viewerHistoryKey,
+        index: viewerIndex,
+      },
+    } satisfies ViewerHistoryState;
+
+    if (currentState?.key === viewerHistoryKey) {
+      if (currentState.index !== viewerIndex) {
+        window.history.replaceState(nextState, "", window.location.href);
+      }
+      return;
+    }
+
+    window.history.pushState(nextState, "", window.location.href);
+  }, [viewerHistoryKey, viewerIndex]);
+
+  const closeViewer = useCallback(() => {
+    if (typeof window !== "undefined") {
+      const currentState = readViewerHistoryState(window.history.state);
+      if (viewerIndexRef.current !== null && currentState?.key === viewerHistoryKey) {
+        window.history.back();
+        return;
+      }
+    }
+
+    setViewerIndex(null);
+  }, [viewerHistoryKey]);
 
   function handlePhotoEdited(previousPhotoId: string, editedPhoto: Photo, blob: Blob) {
     const previousUrl = localPreviewUrls.current.get(previousPhotoId);
@@ -553,13 +798,27 @@ export function PhotoGallery({
       sortPhotosLatestFirst(current.map((photo) =>
         photo.id === previousPhotoId
           ? {
-              ...editedPhoto,
+              ...normalizePhotoPayload(editedPhoto),
+              is_favorite: isFavoritePhoto(editedPhoto),
               url: previewUrl,
             }
           : photo,
       )),
     );
     router.refresh();
+  }
+
+  function updatePhotoFavoriteLocally(photoId: string, favorite: boolean) {
+    setDisplayPhotos((current) =>
+      current.map((photo) =>
+        photo.id === photoId
+          ? {
+              ...photo,
+              is_favorite: favorite,
+            }
+          : photo,
+      ),
+    );
   }
 
   function handlePhotoDeleted(photoId: string) {
@@ -581,10 +840,16 @@ export function PhotoGallery({
       next.delete(photoId);
       return next;
     });
+    setPendingFavoritePhotoIds((current) => {
+      const next = new Set(current);
+      next.delete(photoId);
+      return next;
+    });
+    pendingFavoriteValues.current.delete(photoId);
 
     if (viewerIndex !== null) {
       if (!nextPhotos.length) {
-        setViewerIndex(null);
+        closeViewer();
       } else if (viewerIndex > deletedIndex) {
         setViewerIndex(viewerIndex - 1);
       } else if (viewerIndex === deletedIndex) {
@@ -593,6 +858,60 @@ export function PhotoGallery({
     }
 
     router.refresh();
+  }
+
+  async function setPhotoFavorite(photoId: string, favorite: boolean) {
+    if (pendingFavoriteValues.current.has(photoId)) {
+      return;
+    }
+
+    const currentPhoto = displayPhotos.find((photo) => photo.id === photoId);
+    if (!currentPhoto) {
+      return;
+    }
+
+    const previousFavorite = isFavoritePhoto(currentPhoto);
+    updatePhotoFavoriteLocally(photoId, favorite);
+    pendingFavoriteValues.current.set(photoId, favorite);
+    setPendingFavoritePhotoIds((current) => new Set(current).add(photoId));
+
+    try {
+      const response = await fetch("/api/photos/favorite", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          classNo,
+          groupId,
+          access,
+          photoId,
+          favorite,
+        }),
+      });
+
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as FavoritePhotoResponse | null;
+        if (response.status === 403) {
+          window.location.replace(staleGroupHomePath(classNo, groupId));
+          return;
+        }
+        throw new Error(body?.error ?? "즐겨찾기 저장에 실패했습니다.");
+      }
+
+      const body = (await response.json().catch(() => null)) as FavoritePhotoResponse | null;
+      updatePhotoFavoriteLocally(photoId, body?.favorite ?? favorite);
+    } catch (error) {
+      updatePhotoFavoriteLocally(photoId, previousFavorite);
+      window.alert(error instanceof Error ? error.message : "즐겨찾기 저장에 실패했습니다.");
+    } finally {
+      pendingFavoriteValues.current.delete(photoId);
+      setPendingFavoritePhotoIds((current) => {
+        const next = new Set(current);
+        next.delete(photoId);
+        return next;
+      });
+    }
   }
 
   function toggleSelectionMode() {
@@ -644,7 +963,7 @@ export function PhotoGallery({
   }
 
   return (
-    <div className="grid w-full min-w-0 max-w-full gap-3 overflow-hidden">
+    <div className="grid w-full min-w-0 max-w-full gap-3">
       <form
         id={batchFormId}
         action={softDeletePhotos}
@@ -653,7 +972,6 @@ export function PhotoGallery({
             event.preventDefault();
           }
         }}
-        className="flex w-full min-w-0 max-w-full flex-wrap items-center justify-between gap-3"
         suppressHydrationWarning
       >
         <input type="hidden" name="classNo" value={classNo} />
@@ -662,72 +980,89 @@ export function PhotoGallery({
         {[...selectedPhotoIds].map((photoId) => (
           <input key={photoId} type="hidden" name="photoId" value={photoId} />
         ))}
+      </form>
 
+      <div className="flex w-full min-w-0 max-w-full items-center justify-between gap-3">
         <p className="min-w-0 truncate text-sm font-medium text-zinc-600">
-          {selectionMode ? `${selectedCount}장 선택됨` : `사진 ${displayPhotos.length}장 · ${formatFileSize(totalSize)}`}
+          {`사진 ${displayPhotos.length}장 · ${formatFileSize(totalSize)}`}
         </p>
-        <div className="flex shrink-0 gap-2">
+        {!selectionMode ? (
           <button
             type="button"
             onClick={toggleSelectionMode}
-            className={`rounded-md border border-gray-300 px-3 py-2 text-sm font-semibold ${
-              selectionMode
-                ? "bg-teal-50 text-teal-800 ring-teal-200"
-                : "bg-white text-zinc-800 ring-zinc-300"
-            }`}
+            className="shrink-0 rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800"
           >
             선택
           </button>
-          <button
-            type="button"
-            disabled={!selectedCount}
-            onClick={() => setBatchDeleteDialogOpen(true)}
-            className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-zinc-100 disabled:text-zinc-400"
-          >
-            삭제
-          </button>
-        </div>
-      </form>
+        ) : null}
+      </div>
 
       <section className="grid w-full min-w-0 max-w-full grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
         {visiblePhotos.map((photo, index) => {
           const selected = selectedPhotoIds.has(photo.id);
+          const favorite = isFavoritePhoto(photo);
+          const favoritePending = pendingFavoritePhotoIds.has(photo.id);
 
           return (
             <article
               key={photo.id}
-              className={`min-w-0 overflow-hidden rounded-lg border bg-white shadow-sm ${
+              className={`relative min-w-0 overflow-hidden rounded-lg border bg-white shadow-sm ${
                 selected ? "border-teal-500 ring-2 ring-teal-200" : "border-zinc-200"
               }`}
             >
-              <button
-                type="button"
-                onClick={() => openPhoto(pageStart + index)}
-                className={`group relative block w-full text-left ${
-                  selectionMode ? "cursor-pointer" : "cursor-zoom-in"
-                }`}
-              >
-                <img
-                  src={photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "gallery")}
-                  alt={photo.original_name ?? "group photo"}
-                  loading="lazy"
-                  decoding="async"
-                  sizes="(max-width: 640px) 46vw, (max-width: 1024px) 30vw, 22vw"
-                  className="aspect-square w-full bg-zinc-100 object-cover"
-                />
-                {selectionMode ? (
-                  <span
-                    className={`absolute right-2.5 top-2.5 z-10 grid h-6 w-6 place-items-center rounded-full shadow-[inset_0_0_0_1.5px_rgba(255,255,255,0.98),0_1px_3px_rgba(0,0,0,0.18)] transition ${
-                      selected
-                        ? "bg-teal-600 text-white"
-                        : "bg-white/96 text-transparent"
-                    }`}
-                    aria-hidden="true"
+              <div className="relative aspect-square w-full overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => openPhoto(pageStart + index)}
+                  className={`group absolute inset-0 block text-left ${
+                    selectionMode ? "cursor-pointer" : "cursor-zoom-in"
+                  }`}
+                >
+                  <img
+                    src={photo.url || imageRouteForPhoto(classNo, groupId, photo.id, access, "gallery")}
+                    alt={photo.original_name ?? "group photo"}
+                    loading="lazy"
+                    decoding="async"
+                    sizes="(max-width: 640px) 46vw, (max-width: 1024px) 30vw, 22vw"
+                    className="block h-full w-full bg-zinc-100 object-cover"
+                  />
+                  {selectionMode ? (
+                    <span
+                      className={`absolute right-2.5 top-2.5 z-10 grid h-6 w-6 place-items-center rounded-full shadow-[inset_0_0_0_1.5px_rgba(255,255,255,0.98),0_1px_3px_rgba(0,0,0,0.18)] transition ${
+                        selected
+                          ? "bg-teal-600 text-white"
+                          : "bg-white/96 text-transparent"
+                      }`}
+                      aria-hidden="true"
+                    >
+                      <SelectionCheckIcon />
+                    </span>
+                  ) : null}
+                </button>
+                <div className="pointer-events-none absolute inset-x-0 top-0 z-30 flex justify-start p-2">
+                  <button
+                    type="button"
+                    aria-label={favorite ? "즐겨찾기 해제" : "즐겨찾기 추가"}
+                    aria-pressed={favorite}
+                    disabled={selectionMode || favoritePending}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      if (selectionMode) {
+                        return;
+                      }
+                      void setPhotoFavorite(photo.id, !favorite);
+                    }}
+                    className={`pointer-events-auto inline-flex h-8 w-8 touch-manipulation items-center justify-center rounded-full border border-white/80 bg-white/96 shadow-[0_1px_4px_rgba(0,0,0,0.22)] transition ${
+                      favorite
+                        ? "text-red-600"
+                        : "text-zinc-700"
+                    } disabled:cursor-default disabled:opacity-70 sm:h-9 sm:w-9`}
                   >
-                    <SelectionCheckIcon />
-                  </span>
-                ) : null}
-              </button>
+                    <HeartIcon className="h-4 w-4 sm:h-[18px] sm:w-[18px]" filled={favorite} />
+                  </button>
+                </div>
+              </div>
               <div className="grid gap-1 p-3">
                 <p className="truncate text-sm font-semibold">{photo.original_name ?? "사진"}</p>
                 <p className="text-xs text-zinc-500">{koDate(photo.created_at)}</p>
@@ -761,6 +1096,39 @@ export function PhotoGallery({
           </button>
         </nav>
       ) : null}
+      {selectionMode ? <div className="h-28" aria-hidden="true" /> : null}
+      {selectionMode && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="pointer-events-none fixed left-3 right-3 z-[80] sm:left-6 sm:right-6"
+              style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 0.75rem)" }}
+            >
+              <div className="pointer-events-auto mx-auto flex w-full max-w-5xl items-center justify-between gap-3 rounded-2xl border border-zinc-300 bg-zinc-100/95 px-4 py-3 shadow-xl backdrop-blur">
+                <p className="min-w-0 truncate text-sm font-semibold text-zinc-700">
+                  {selectedCount}장 선택됨
+                </p>
+                <div className="flex shrink-0 items-center gap-2 whitespace-nowrap">
+                  <button
+                    type="button"
+                    disabled={!selectedCount}
+                    onClick={() => setBatchDeleteDialogOpen(true)}
+                    className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-zinc-100 disabled:text-zinc-400"
+                  >
+                    삭제
+                  </button>
+                  <button
+                    type="button"
+                    onClick={toggleSelectionMode}
+                    className="rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm font-semibold text-zinc-800"
+                  >
+                    선택 종료
+                  </button>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
 
       {viewerIndex !== null && displayPhotos[viewerIndex] ? (
         <PhotoViewer
@@ -770,9 +1138,11 @@ export function PhotoGallery({
           photos={displayPhotos}
           onPhotoEdited={handlePhotoEdited}
           onPhotoDeleted={handlePhotoDeleted}
+          onPhotoFavoriteChange={setPhotoFavorite}
+          favoritePending={pendingFavoritePhotoIds.has(displayPhotos[viewerIndex].id)}
           index={viewerIndex}
           onIndexChange={setViewerIndex}
-          onClose={() => setViewerIndex(null)}
+          onClose={closeViewer}
         />
       ) : null}
       {batchDeleteDialogOpen ? (
@@ -793,6 +1163,8 @@ function PhotoViewer({
   photos,
   onPhotoEdited,
   onPhotoDeleted,
+  onPhotoFavoriteChange,
+  favoritePending,
   index,
   onIndexChange,
   onClose,
@@ -803,6 +1175,8 @@ function PhotoViewer({
   photos: PhotoWithUrl[];
   onPhotoEdited: (previousPhotoId: string, editedPhoto: Photo, blob: Blob) => void;
   onPhotoDeleted: (photoId: string) => void;
+  onPhotoFavoriteChange: (photoId: string, favorite: boolean) => Promise<void>;
+  favoritePending: boolean;
   index: number;
   onIndexChange: (index: number) => void;
   onClose: () => void;
@@ -848,6 +1222,7 @@ function PhotoViewer({
   });
   const [viewerImageState, setViewerImageState] = useState<"loading" | "loaded" | "error">("loading");
   const imageSize = loadedImage;
+  const favorite = isFavoritePhoto(photo);
 
   const canMove = photos.length > 1;
   const viewerReady = viewerImage.photoId === photo.id && viewerImageState === "loaded";
@@ -2011,70 +2386,170 @@ function PhotoViewer({
 
       </div>
 
-      <footer className="z-10 flex min-h-16 w-full items-center gap-2 bg-black/88 px-3 py-3">
-        <div className="flex min-w-0 flex-1 flex-nowrap items-center justify-start gap-2 overflow-x-auto">
-          <button
-            type="button"
-            aria-label="회전"
-            disabled={Boolean(saving) || deleting || !viewerReady}
-            onClick={rotateCounterClockwise}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-white disabled:text-zinc-950 disabled:opacity-100 sm:w-auto sm:px-3"
-          >
-            <RotateIcon />
-            <span className="hidden sm:inline">회전</span>
-          </button>
-          <button
-            type="button"
-            aria-label="자르기"
-            disabled={Boolean(saving) || deleting || !viewerReady || cropMode}
-            onClick={startCropMode}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-white disabled:text-zinc-950 disabled:opacity-100 sm:w-auto sm:px-3"
-          >
-            <CropIcon />
-            <span className="hidden sm:inline">자르기</span>
-          </button>
-          <button
-            type="button"
-            aria-label="취소"
-            disabled={Boolean(saving) || deleting || !hasPendingEdit}
-            onClick={cancelPendingEdit}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400 sm:w-auto sm:px-3"
-          >
-            <CloseIcon />
-            <span className="hidden sm:inline">취소</span>
-          </button>
-          <button
-            type="button"
-            aria-label={saving ? "저장 중" : "저장"}
-            disabled={Boolean(saving) || deleting || !viewerReady || !hasPendingEdit}
-            onClick={saveEdit}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400 sm:w-auto sm:px-3"
-          >
-            <SaveIcon />
-            <span className="hidden sm:inline">{saving ? "저장 중" : "저장"}</span>
-          </button>
-          <button
-            type="button"
-            aria-label={downloading ? "내려받는 중" : "내려받기"}
-            disabled={Boolean(saving) || downloading || deleting || !viewerReady}
-            onClick={() => void downloadCurrentPhoto()}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400 sm:w-auto sm:px-3"
-          >
-            <DownloadIcon />
-            <span className="hidden sm:inline">{downloading ? "내려받는 중" : "내려받기"}</span>
-          </button>
+      <footer className="z-10 min-h-16 w-full bg-black/88 px-3 py-3">
+        <div className="flex min-w-0 flex-nowrap items-center gap-2 sm:hidden">
+          <div className="shrink-0">
+            <button
+              type="button"
+              aria-label={favorite ? "즐겨찾기 해제" : "즐겨찾기 추가"}
+              aria-pressed={favorite}
+              disabled={Boolean(saving) || deleting || favoritePending}
+              onClick={() => void onPhotoFavoriteChange(photo.id, !favorite)}
+              className={`inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border bg-white px-0 text-sm font-semibold shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400 ${
+                favorite
+                  ? "border-red-200 text-red-600"
+                  : "border-zinc-200 text-zinc-950"
+              }`}
+            >
+              <HeartIcon filled={favorite} />
+            </button>
+          </div>
+          <div className="flex min-w-0 flex-1 items-center justify-center">
+            <div className="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-x-auto px-1">
+              <button
+                type="button"
+                aria-label="회전"
+                disabled={Boolean(saving) || deleting || !viewerReady}
+                onClick={rotateCounterClockwise}
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-white disabled:text-zinc-950 disabled:opacity-100"
+              >
+                <RotateIcon />
+              </button>
+              <button
+                type="button"
+                aria-label="자르기"
+                disabled={Boolean(saving) || deleting || !viewerReady || cropMode}
+                onClick={startCropMode}
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-white disabled:text-zinc-950 disabled:opacity-100"
+              >
+                <CropIcon />
+              </button>
+              <button
+                type="button"
+                aria-label="취소"
+                disabled={Boolean(saving) || deleting || !hasPendingEdit}
+                onClick={cancelPendingEdit}
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400"
+              >
+                <CloseIcon />
+              </button>
+              <button
+                type="button"
+                aria-label={saving ? "저장 중" : "저장"}
+                disabled={Boolean(saving) || deleting || favoritePending || !viewerReady || !hasPendingEdit}
+                onClick={saveEdit}
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400"
+              >
+                <SaveIcon />
+              </button>
+              <button
+                type="button"
+                aria-label={downloading ? "내려받는 중" : "내려받기"}
+                disabled={Boolean(saving) || downloading || deleting || !viewerReady}
+                onClick={() => void downloadCurrentPhoto()}
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-0 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400"
+              >
+                <DownloadIcon />
+              </button>
+            </div>
+          </div>
+          <div className="shrink-0">
+            <button
+              type="button"
+              aria-label="삭제"
+              disabled={Boolean(saving) || deleting || favoritePending || !viewerReady}
+              onClick={() => setDeleteDialogOpen(true)}
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-red-300 bg-red-50 px-0 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:border-red-300 disabled:bg-red-50 disabled:text-red-700 disabled:opacity-100"
+            >
+              <TrashIcon />
+            </button>
+          </div>
         </div>
-        <div className="shrink-0">
-          <button
-            type="button"
-            aria-label="삭제"
-            disabled={Boolean(saving) || deleting || !viewerReady}
-            onClick={() => setDeleteDialogOpen(true)}
-            className="inline-flex h-10 w-10 items-center justify-center gap-1.5 rounded-md border border-red-300 bg-red-50 px-0 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:border-red-300 disabled:bg-red-50 disabled:text-red-700 disabled:opacity-100 sm:w-auto sm:px-3"
-          >
-            <TrashIcon />
-            <span className="hidden sm:inline">삭제</span>
-          </button>
+
+        <div className="hidden min-w-0 items-center gap-3 sm:grid sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+          <div className="flex items-center justify-start">
+            <button
+              type="button"
+              aria-label={favorite ? "즐겨찾기 해제" : "즐겨찾기 추가"}
+              aria-pressed={favorite}
+              disabled={Boolean(saving) || deleting || favoritePending}
+              onClick={() => void onPhotoFavoriteChange(photo.id, !favorite)}
+              className={`inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border bg-white px-3 text-sm font-semibold shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400 ${
+                favorite
+                  ? "border-red-200 text-red-600"
+                  : "border-zinc-200 text-zinc-950"
+              }`}
+            >
+              <HeartIcon filled={favorite} />
+              <span>즐겨찾기</span>
+            </button>
+          </div>
+
+          <div className="flex min-w-0 items-center justify-center gap-2">
+            <button
+              type="button"
+              aria-label="회전"
+              disabled={Boolean(saving) || deleting || !viewerReady}
+              onClick={rotateCounterClockwise}
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-3 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-white disabled:text-zinc-950 disabled:opacity-100"
+            >
+              <RotateIcon />
+              <span>회전</span>
+            </button>
+            <button
+              type="button"
+              aria-label="자르기"
+              disabled={Boolean(saving) || deleting || !viewerReady || cropMode}
+              onClick={startCropMode}
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-3 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-zinc-200 disabled:bg-white disabled:text-zinc-950 disabled:opacity-100"
+            >
+              <CropIcon />
+              <span>자르기</span>
+            </button>
+            <button
+              type="button"
+              aria-label="취소"
+              disabled={Boolean(saving) || deleting || !hasPendingEdit}
+              onClick={cancelPendingEdit}
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-3 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400"
+            >
+              <CloseIcon />
+              <span>취소</span>
+            </button>
+            <button
+              type="button"
+              aria-label={saving ? "저장 중" : "저장"}
+              disabled={Boolean(saving) || deleting || favoritePending || !viewerReady || !hasPendingEdit}
+              onClick={saveEdit}
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-3 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400"
+            >
+              <SaveIcon />
+              <span>{saving ? "저장 중" : "저장"}</span>
+            </button>
+            <button
+              type="button"
+              aria-label={downloading ? "내려받는 중" : "내려받기"}
+              disabled={Boolean(saving) || downloading || deleting || !viewerReady}
+              onClick={() => void downloadCurrentPhoto()}
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-3 text-sm font-semibold text-zinc-950 shadow-sm disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/70 disabled:text-zinc-400"
+            >
+              <DownloadIcon />
+              <span>{downloading ? "내려받는 중" : "내려받기"}</span>
+            </button>
+          </div>
+
+          <div className="flex items-center justify-end">
+            <button
+              type="button"
+              aria-label="삭제"
+              disabled={Boolean(saving) || deleting || favoritePending || !viewerReady}
+              onClick={() => setDeleteDialogOpen(true)}
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-red-300 bg-red-50 px-3 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:border-red-300 disabled:bg-red-50 disabled:text-red-700 disabled:opacity-100"
+            >
+              <TrashIcon />
+              <span>삭제</span>
+            </button>
+          </div>
         </div>
       </footer>
       {deleteDialogOpen ? (

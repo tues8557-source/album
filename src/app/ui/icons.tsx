@@ -63,3 +63,26 @@ export function DownloadIcon({
     </svg>
   );
 }
+
+export function HeartIcon({
+  className = "h-5 w-5",
+  strokeWidth = 1.9,
+  filled = false,
+}: IconProps & { filled?: boolean }) {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className={className}
+      fill={filled ? "currentColor" : "none"}
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+    >
+      <path
+        d="M12 20.2c-4.9-3.1-8-5.9-8-9.7 0-2.5 1.9-4.7 4.5-4.7 1.7 0 2.8.7 3.5 2 0.7-1.3 1.8-2 3.5-2 2.6 0 4.5 2.2 4.5 4.7 0 3.8-3.1 6.6-8 9.7Z"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}

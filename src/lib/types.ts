@@ -16,6 +16,7 @@ export type Group = {
   class_no: number;
   sort_order: number;
   password_hash: string | null;
+  access_nonce: string | null;
   deleted_at: string | null;
 };
 
@@ -33,6 +34,7 @@ export type Photo = {
   original_name: string | null;
   mime_type: string | null;
   size: number | null;
+  is_favorite: boolean;
   created_at: string;
   deleted_at: string | null;
 };

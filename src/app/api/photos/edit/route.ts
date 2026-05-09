@@ -4,7 +4,7 @@ import { NextResponse } from "next/server";
 import { revalidatePath, revalidateTag } from "next/cache";
 import { safeFileName } from "@/lib/format";
 import { activePhotosTag, deletedPhotosTag } from "@/lib/photo-assets";
-import { readSignedToken } from "@/lib/security";
+import { hasValidGroupAccessToken, readSignedToken } from "@/lib/security";
 import { createServiceSupabase } from "@/lib/supabase/server";
 
 const ALLOWED_EXTENSIONS = /\.(jpe?g|png|gif|webp|heic|heif)$/i;
@@ -17,7 +17,7 @@ async function canAccessGroup(classNo: number, groupId: string, access: string) 
   const supabase = createServiceSupabase();
   const { data: group, error } = await supabase
     .from("groups")
-    .select("password_hash")
+    .select("*")
     .eq("id", groupId)
     .eq("class_no", classNo)
     .is("deleted_at", null)
@@ -29,7 +29,7 @@ async function canAccessGroup(classNo: number, groupId: string, access: string) 
 
   const store = await cookies();
   const admin = readSignedToken(store.get("album_admin")?.value) === "admin";
-  const groupSession = readSignedToken(access) === `group:${groupId}`;
+  const groupSession = hasValidGroupAccessToken(access, groupId, group.access_nonce);
   return admin || !group.password_hash || groupSession;
 }
 
@@ -52,7 +52,7 @@ export async function POST(request: Request) {
   const supabase = createServiceSupabase();
   const { data: photo, error: photoError } = await supabase
     .from("photos")
-    .select("id, storage_path, original_name, created_at")
+    .select("*")
     .eq("id", photoId)
     .eq("group_id", groupId)
     .is("deleted_at", null)
@@ -77,6 +77,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: uploadError.message }, { status: 500 });
   }
 
+  const favoriteRequested = Boolean((photo as { is_favorite?: boolean }).is_favorite);
   const { data: editedPhoto, error: insertError } = await supabase
     .from("photos")
     .insert({
@@ -93,6 +94,32 @@ export async function POST(request: Request) {
   if (insertError || !editedPhoto) {
     await supabase.storage.from("group-photos").remove([storagePath]);
     return NextResponse.json({ error: insertError?.message ?? "편집한 사진 기록 저장에 실패했습니다." }, { status: 500 });
+  }
+
+  let normalizedEditedPhoto = {
+    ...editedPhoto,
+    is_favorite: Boolean((editedPhoto as { is_favorite?: boolean }).is_favorite),
+  };
+
+  if (favoriteRequested) {
+    const { error: favoriteError } = await supabase
+      .from("photos")
+      .update({ is_favorite: true })
+      .eq("id", editedPhoto.id)
+      .eq("group_id", groupId);
+
+    if (favoriteError && favoriteError.code !== "42703") {
+      await supabase.storage.from("group-photos").remove([storagePath]);
+      await supabase.from("photos").delete().eq("id", editedPhoto.id).eq("group_id", groupId);
+      return NextResponse.json({ error: favoriteError.message }, { status: 500 });
+    }
+
+    if (!favoriteError) {
+      normalizedEditedPhoto = {
+        ...normalizedEditedPhoto,
+        is_favorite: true,
+      };
+    }
   }
 
   const deletedAt = new Date().toISOString();
@@ -113,5 +140,5 @@ export async function POST(request: Request) {
   revalidateTag(deletedPhotosTag(groupId), "max");
   revalidatePath(`/classes/${classNo}/groups/${groupId}`);
   revalidatePath(`/classes/${classNo}/groups/${groupId}/trash`);
-  return NextResponse.json({ saved: true, photo: editedPhoto });
+  return NextResponse.json({ saved: true, photo: normalizedEditedPhoto });
 }
